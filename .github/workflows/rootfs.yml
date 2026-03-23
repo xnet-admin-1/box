@@ -1,0 +1,104 @@
+name: "Build Ubuntu Rootfs"
+run-name: "Ubuntu 24.04 rootfs (aarch64)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Ubuntu point release (e.g. 24.04.4)"
+        required: false
+        default: "24.04.4"
+  push:
+    paths:
+      - "rootfs/**"
+      - ".github/workflows/rootfs.yml"
+
+env:
+  UBUNTU_VERSION: "24.04"
+  UBUNTU_POINT: ${{ github.event.inputs.version || '24.04.4' }}
+  BASE_URL: "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            pd_arch: aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download ubuntu-base
+        run: |
+          curl -fSL -o /tmp/rootfs.tar.gz \
+            "${{ env.BASE_URL }}/ubuntu-base-${{ env.UBUNTU_POINT }}-base-${{ matrix.arch }}.tar.gz"
+          echo "Downloaded $(du -h /tmp/rootfs.tar.gz | cut -f1)"
+
+      - name: Repackage as tar.xz
+        run: |
+          mkdir -p /tmp/rootfs
+          sudo tar xzf /tmp/rootfs.tar.gz -C /tmp/rootfs
+          rm /tmp/rootfs.tar.gz
+
+          sudo find /tmp/rootfs/dev -mindepth 1 -delete 2>/dev/null || true
+          sudo find /tmp/rootfs -type d -perm -400 -print0 | xargs -0 sudo chmod 755
+
+          OUTFILE="box-ubuntu-${{ env.UBUNTU_VERSION }}-${{ matrix.pd_arch }}.tar.xz"
+          sudo tar \
+            --directory=/tmp \
+            --create \
+            --sort=name \
+            --hard-dereference \
+            --numeric-owner \
+            --preserve-permissions \
+            --xz \
+            --file="/tmp/${OUTFILE}" \
+            rootfs
+
+          echo "ROOTFS_FILE=/tmp/${OUTFILE}" >> "$GITHUB_ENV"
+          echo "ROOTFS_NAME=${OUTFILE}" >> "$GITHUB_ENV"
+
+          ls -lh "/tmp/${OUTFILE}"
+          sha256sum "/tmp/${OUTFILE}" | tee "/tmp/${OUTFILE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: box-ubuntu-${{ env.UBUNTU_VERSION }}-${{ matrix.pd_arch }}
+          path: |
+            ${{ env.ROOTFS_FILE }}
+            ${{ env.ROOTFS_FILE }}.sha256
+          retention-days: 90
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: rootfs
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "rootfs-ubuntu-${{ env.UBUNTU_POINT }}"
+          name: "Box Ubuntu ${{ env.UBUNTU_POINT }} Rootfs"
+          body: |
+            Ubuntu ${{ env.UBUNTU_POINT }} base rootfs for Box.
+
+            Canonical's `ubuntu-base` cloud image repackaged as `tar.xz` with
+            `--hard-dereference` for Android compatibility.
+
+            **Architecture:** aarch64
+            **Source:** ${{ env.BASE_URL }}
+          files: rootfs/*
+          draft: false
+          prerelease: false

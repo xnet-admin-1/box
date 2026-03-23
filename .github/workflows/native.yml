@@ -1,0 +1,179 @@
+name: "Build Native Binaries"
+run-name: "Box native — talloc + libarchive + proot (aarch64)"
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/native.yml"
+      - "build.sh"
+      - "talloc/**"
+      - "libarchive/**"
+      - "proot/**"
+
+env:
+  PROOT_REPO: "termux/proot"
+  PROOT_BRANCH: "master"
+  TALLOC_VERSION: "2.4.4"
+  LIBARCHIVE_VERSION: "3.8.6"
+  NDK_VERSION: "r27c"
+  ANDROID_API: 26
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build gawk
+
+      - name: Install Android NDK
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip" \
+            -O /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          rm /tmp/ndk.zip
+          TOOLCHAIN="/opt/android-ndk-${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "NDK=/opt/android-ndk-${{ env.NDK_VERSION }}" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android${{ env.ANDROID_API }}-clang" >> "$GITHUB_ENV"
+          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> "$GITHUB_ENV"
+          echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> "$GITHUB_ENV"
+
+      # ── talloc ───────────────────────────────────────────────────
+      - name: Build talloc
+        run: |
+          cd /tmp
+          wget -q "https://www.samba.org/ftp/talloc/talloc-${{ env.TALLOC_VERSION }}.tar.gz"
+          tar xzf "talloc-${{ env.TALLOC_VERSION }}.tar.gz"
+          cd "talloc-${{ env.TALLOC_VERSION }}"
+
+          cat > cross-answers.txt <<'ANSWERS'
+          Checking uname sysname type: "Linux"
+          Checking uname machine type: "dontcare"
+          Checking uname release type: "dontcare"
+          Checking uname version type: "dontcare"
+          Checking simple C program: OK
+          rpath library support: OK
+          -Wl,--version-script support: FAIL
+          Checking getconf LFS_CFLAGS: OK
+          Checking for large file support without additional flags: OK
+          Checking for -D_FILE_OFFSET_BITS=64: OK
+          Checking for -D_LARGE_FILES: OK
+          Checking correct behavior of strtoll: OK
+          Checking for working strptime: OK
+          Checking for C99 vsnprintf: OK
+          Checking for HAVE_SHARED_MMAP: OK
+          Checking for HAVE_MREMAP: OK
+          Checking for HAVE_INCOHERENT_MMAP: OK
+          Checking for HAVE_SECURE_MKSTEMP: OK
+          Checking getconf large file support flags work: OK
+          Checking for HAVE_IFACE_IFCONF: FAIL
+          ANSWERS
+
+          mkdir -p /tmp/mock-bin
+          ln -sf "$CC" /tmp/mock-bin/cc
+          export PATH="/tmp/mock-bin:$PATH"
+
+          ./configure --prefix=/tmp/talloc-install \
+            --disable-rpath --disable-python \
+            --cross-compile --cross-answers=cross-answers.txt
+          make -j$(nproc)
+
+          mkdir -p /tmp/talloc-out/{include,lib}
+          "$AR" rcs /tmp/talloc-out/lib/libtalloc.a bin/default/talloc.c.5.o bin/default/lib/replace/replace.c.1.o bin/default/lib/replace/closefrom.c.1.o
+          cp talloc.h /tmp/talloc-out/include/
+          cp bin/default/libtalloc.so /tmp/talloc-out/lib/libtalloc.so
+          "$STRIP" /tmp/talloc-out/lib/libtalloc.so
+
+      # ── libarchive ──────────────────────────────────────────────
+      - name: Build libarchive + bsdtar
+        run: |
+          cd /tmp
+          wget -q "https://github.com/libarchive/libarchive/releases/download/v${{ env.LIBARCHIVE_VERSION }}/libarchive-${{ env.LIBARCHIVE_VERSION }}.tar.xz"
+          tar xJf "libarchive-${{ env.LIBARCHIVE_VERSION }}.tar.xz"
+
+          cmake -S "libarchive-${{ env.LIBARCHIVE_VERSION }}" -B /tmp/libarchive-build \
+            -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_ANDROID_NDK="/opt/android-ndk-${{ env.NDK_VERSION }}" \
+            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
+            -DCMAKE_ANDROID_STL_TYPE=c++_static \
+            -DCMAKE_SYSTEM_VERSION=${{ env.ANDROID_API }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TEST=OFF -DENABLE_TAR=ON -DENABLE_CPIO=OFF \
+            -DENABLE_CAT=OFF -DENABLE_UNZIP=OFF -DENABLE_XATTR=OFF \
+            -DENABLE_ACL=OFF -DENABLE_ICONV=OFF -DENABLE_EXPAT=OFF \
+            -DENABLE_LIBXML2=OFF -DENABLE_OPENSSL=OFF -DENABLE_LIBB2=OFF \
+            -DENABLE_LZ4=OFF -DENABLE_ZSTD=OFF -DENABLE_LZMA=OFF -DENABLE_BZip2=OFF
+
+          cmake --build /tmp/libarchive-build --target bsdtar
+          "$STRIP" /tmp/libarchive-build/bin/bsdtar
+
+      # ── proot ────────────────────────────────────────────────────
+      - name: Build PRoot
+        run: |
+          git clone --depth=1 --branch=${{ env.PROOT_BRANCH }} \
+            "https://github.com/${{ env.PROOT_REPO }}.git" /tmp/proot
+          cd /tmp/proot/src
+
+          export CFLAGS="-I/tmp/talloc-out/include"
+          export LDFLAGS="-L/tmp/talloc-out/lib"
+          export PROOT_UNBUNDLE_LOADER="../libexec/proot"
+
+          if ! grep -q '#include <string.h>' extension/ashmem_memfd/ashmem_memfd.c; then
+            sed -i '1i #include <string.h>' extension/ashmem_memfd/ashmem_memfd.c
+          fi
+
+          make V=1 PREFIX=/tmp/proot-install install
+          "$STRIP" /tmp/proot-install/bin/proot
+          find /tmp/proot-install/libexec -type f | xargs "$STRIP" 2>/dev/null || true
+
+      # ── package ──────────────────────────────────────────────────
+      - name: Package
+        run: |
+          mkdir -p /tmp/out/arm64-v8a
+          cp /tmp/proot-install/bin/proot /tmp/out/arm64-v8a/libproot-xed.so
+          [ -f /tmp/proot-install/libexec/proot/loader ] && cp /tmp/proot-install/libexec/proot/loader /tmp/out/arm64-v8a/libproot.so
+          [ -f /tmp/proot-install/libexec/proot/loader32 ] && cp /tmp/proot-install/libexec/proot/loader32 /tmp/out/arm64-v8a/libproot32.so
+          cp /tmp/talloc-out/lib/libtalloc.so /tmp/out/arm64-v8a/libtalloc.so
+          cp /tmp/libarchive-build/bin/bsdtar /tmp/out/arm64-v8a/libbsdtar.so
+
+          echo "=== Artifacts ==="
+          ls -lh /tmp/out/arm64-v8a/
+          file /tmp/out/arm64-v8a/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: box-native-arm64-v8a
+          path: /tmp/out/
+          retention-days: 90
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "native-latest"
+          name: "Box Native (Android aarch64)"
+          body: |
+            Cross-compiled native binaries for Box.
+
+            **PRoot** from `${{ env.PROOT_REPO }}` @ `${{ env.PROOT_BRANCH }}`
+            **talloc** ${{ env.TALLOC_VERSION }}
+            **libarchive** ${{ env.LIBARCHIVE_VERSION }}
+            **NDK** ${{ env.NDK_VERSION }}, API ${{ env.ANDROID_API }}
+
+            | File | Description |
+            |------|-------------|
+            | `libproot-xed.so` | PRoot binary (Termux-patched) |
+            | `libproot.so` | PRoot loader (64-bit) |
+            | `libproot32.so` | PRoot loader (32-bit) |
+            | `libtalloc.so` | talloc — PRoot dependency |
+            | `libbsdtar.so` | libarchive/bsdtar — PRoot dependency |
+          files: /tmp/out/arm64-v8a/*
+          draft: false
+          prerelease: false

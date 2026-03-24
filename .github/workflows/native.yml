@@ -133,15 +133,15 @@ jobs:
 
           make V=1 PREFIX=/tmp/proot-install install
           "$STRIP" /tmp/proot-install/bin/proot
-          find /tmp/proot-install/libexec -type f | xargs "$STRIP" 2>/dev/null || true
+          find /tmp/proot/libexec -type f | xargs "$STRIP" 2>/dev/null || true
 
       # ── package ──────────────────────────────────────────────────
       - name: Package
         run: |
           mkdir -p /tmp/out/arm64-v8a
           cp /tmp/proot-install/bin/proot /tmp/out/arm64-v8a/libproot-xed.so
-          [ -f /tmp/proot-install/libexec/proot/loader ] && cp /tmp/proot-install/libexec/proot/loader /tmp/out/arm64-v8a/libproot.so
-          [ -f /tmp/proot-install/libexec/proot/loader32 ] && cp /tmp/proot-install/libexec/proot/loader32 /tmp/out/arm64-v8a/libproot32.so
+          [ -f /tmp/proot/libexec/proot/loader ] && cp /tmp/proot/libexec/proot/loader /tmp/out/arm64-v8a/libproot.so
+          [ -f /tmp/proot/libexec/proot/loader32 ] && cp /tmp/proot/libexec/proot/loader32 /tmp/out/arm64-v8a/libproot32.so
           cp /tmp/talloc-out/lib/libtalloc.so /tmp/out/arm64-v8a/libtalloc.so
           cp /tmp/libarchive-build/bin/bsdtar /tmp/out/arm64-v8a/libbsdtar.so
 

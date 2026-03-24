@@ -33,8 +33,8 @@ box/
 
 | File | Description |
 |------|-------------|
-| `ubuntu-24.04-aarch64.tar.xz` | Ubuntu 24.04 base rootfs for proot |
-| `ubuntu-24.04-aarch64.tar.xz.sha256` | SHA256 checksum |
+| `box-ubuntu-24.04-aarch64.tar.xz` | Ubuntu 24.04 base rootfs for proot |
+| `box-ubuntu-24.04-aarch64.tar.xz.sha256` | SHA256 checksum |
 
 ## Build Locally
 

@@ -1,0 +1,106 @@
+name: "Build Alpine Rootfs"
+run-name: "Alpine 3.21 rootfs (aarch64)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Alpine minor version (e.g. 3.21.3)"
+        required: false
+        default: "3.21.3"
+  push:
+    paths:
+      - "rootfs/**"
+      - ".github/workflows/rootfs-alpine.yml"
+
+env:
+  ALPINE_MAJOR: "3.21"
+  ALPINE_VERSION: ${{ github.event.inputs.version || '3.21.3' }}
+  BASE_URL: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            pd_arch: aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Alpine minirootfs
+        run: |
+          curl -fSL -o /tmp/rootfs.tar.gz \
+            "${{ env.BASE_URL }}/${{ matrix.arch }}/alpine-minirootfs-${{ env.ALPINE_VERSION }}-${{ matrix.arch }}.tar.gz"
+          echo "Downloaded $(du -h /tmp/rootfs.tar.gz | cut -f1)"
+
+      - name: Repackage as tar.xz
+        run: |
+          mkdir -p /tmp/rootfs
+          sudo tar xzf /tmp/rootfs.tar.gz -C /tmp/rootfs
+          rm /tmp/rootfs.tar.gz
+
+          sudo find /tmp/rootfs/dev -mindepth 1 -delete 2>/dev/null || true
+          sudo find /tmp/rootfs -type d -perm -400 -print0 | xargs -0 sudo chmod 755
+
+          OUTFILE="box-alpine-${{ env.ALPINE_MAJOR }}-${{ matrix.pd_arch }}.tar.xz"
+          sudo tar \
+            --directory=/tmp \
+            --create \
+            --sort=name \
+            --hard-dereference \
+            --numeric-owner \
+            --preserve-permissions \
+            --xz \
+            --file="/tmp/${OUTFILE}" \
+            rootfs
+
+          echo "ROOTFS_FILE=/tmp/${OUTFILE}" >> "$GITHUB_ENV"
+          echo "ROOTFS_NAME=${OUTFILE}" >> "$GITHUB_ENV"
+
+          ls -lh "/tmp/${OUTFILE}"
+          sha256sum "/tmp/${OUTFILE}" | tee "/tmp/${OUTFILE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: box-alpine-${{ env.ALPINE_MAJOR }}-${{ matrix.pd_arch }}
+          path: |
+            ${{ env.ROOTFS_FILE }}
+            ${{ env.ROOTFS_FILE }}.sha256
+          retention-days: 90
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: rootfs
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "rootfs-alpine-${{ env.ALPINE_VERSION }}"
+          name: "Box Alpine ${{ env.ALPINE_VERSION }} Rootfs"
+          body: |
+            Alpine ${{ env.ALPINE_VERSION }} minirootfs for Box.
+
+            Alpine Linux minirootfs repackaged as `tar.xz` with
+            `--hard-dereference` for Android compatibility.
+
+            ~3MB base image. musl libc + busybox + apk.
+
+            **Architecture:** aarch64
+            **Source:** ${{ env.BASE_URL }}/${{ matrix.arch }}/
+          files: rootfs/*
+          draft: false
+          prerelease: false

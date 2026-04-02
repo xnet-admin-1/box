@@ -17,6 +17,10 @@ env:
   ALPINE_MAJOR: "3.21"
   ALPINE_VERSION: ${{ github.event.inputs.version || '3.21.3' }}
   BASE_URL: "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -89,6 +93,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: "rootfs-alpine-${{ env.ALPINE_VERSION }}"
           name: "Box Alpine ${{ env.ALPINE_VERSION }} Rootfs"
           body: |

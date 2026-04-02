@@ -18,6 +18,10 @@ env:
   LIBARCHIVE_VERSION: "3.8.6"
   NDK_VERSION: "r27c"
   ANDROID_API: 26
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -159,6 +163,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: "native-latest"
           name: "Box Native (Android aarch64)"
           body: |

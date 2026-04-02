@@ -17,6 +17,10 @@ env:
   UBUNTU_VERSION: "24.04"
   UBUNTU_POINT: ${{ github.event.inputs.version || '24.04.4' }}
   BASE_URL: "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -89,6 +93,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: "rootfs-ubuntu-${{ env.UBUNTU_POINT }}"
           name: "Box Ubuntu ${{ env.UBUNTU_POINT }} Rootfs"
           body: |

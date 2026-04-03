@@ -52,7 +52,7 @@ jobs:
 
           OUTFILE="box-alpine-${{ env.ALPINE_MAJOR }}-${{ matrix.pd_arch }}.tar.xz"
           sudo tar \
-            --directory=/tmp \
+            --directory=/tmp/rootfs \
             --create \
             --sort=name \
             --hard-dereference \
@@ -60,7 +60,7 @@ jobs:
             --preserve-permissions \
             --xz \
             --file="/tmp/${OUTFILE}" \
-            rootfs
+            .
 
           echo "ROOTFS_FILE=/tmp/${OUTFILE}" >> "$GITHUB_ENV"
           echo "ROOTFS_NAME=${OUTFILE}" >> "$GITHUB_ENV"

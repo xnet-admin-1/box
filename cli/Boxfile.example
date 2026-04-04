@@ -1,0 +1,16 @@
+# Example Boxfile — multi-service container setup
+# Run with: box up Boxfile.example
+
+SERVICE dev
+FROM ubuntu
+PACKAGES python3 git curl wget
+ENV LANG=C.UTF-8
+VOLUME $DATA/workspace:/workspace
+WORKDIR /workspace
+CMD bash
+
+SERVICE mcp
+FROM alpine
+PACKAGES nodejs npm
+EXPOSE 39811
+CMD node /srv/mcp-server.js

@@ -1,0 +1,1108 @@
+#!/system/bin/sh
+# box — container runtime CLI for Android
+# Manages PRoot-based containers from Android sh (toybox/mksh).
+# No root required. Mirrored networking (host stack shared).
+#
+# Usage: box <command> [args...]
+#
+# Commands:
+#   run <image> [-- cmd...]    Create and start a container
+#   exec <name> [-- cmd...]    Run a command in a running container
+#   up [boxfile]               Start all services from Boxfile
+#   down                       Stop all services from Boxfile
+#   ps                         List running containers
+#   stop <name>                Stop a container
+#   rm <name>                  Remove a container
+#   images                     List installed rootfs images
+#   pull <image>               Download a rootfs image
+#   logs <name>                Show container logs
+#   inspect <name>             Show container config
+#   help                       Show this help
+#
+# Environment:
+#   BOX_HOME     Base directory (default: auto-detect app filesDir)
+#   BOX_EXT      External storage (default: auto-detect app-scoped ext)
+#   BOX_BIN      Directory with proot/bsdtar binaries
+
+set -u
+
+VERSION="0.1.0"
+
+# ── paths ──────────────────────────────────────────────────────────
+
+# Auto-detect BOX_HOME from common app data locations
+detect_home() {
+    # If running inside an app context, filesDir is usually available
+    for candidate in \
+        "/data/data/sh.haven/files/box" \
+        "/data/data/com.haven/files/box" \
+        "/data/data/com.mcpshell/files/box" \
+        "$HOME/box" \
+        "/data/local/tmp/box"; do
+        if [ -d "$(dirname "$candidate")" ]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "$HOME/box"
+}
+
+BOX_HOME="${BOX_HOME:-$(detect_home)}"
+BOX_EXT="${BOX_EXT:-/storage/emulated/0/Android/data/sh.haven/files/box}"
+BOX_CONTAINERS="$BOX_HOME/containers"
+BOX_IMAGES="$BOX_HOME/images"
+BOX_RUN="$BOX_HOME/run"
+BOX_CACHE="${BOX_CACHE:-$BOX_HOME/cache}"
+
+# Binary paths — auto-detect from app nativeLibraryDir or BOX_BIN
+detect_bin() {
+    if [ -n "${BOX_BIN:-}" ] && [ -d "$BOX_BIN" ]; then
+        echo "$BOX_BIN"
+        return
+    fi
+    for candidate in \
+        "/data/data/sh.haven/lib" \
+        "/data/data/com.haven/lib" \
+        "/data/app/~~*/sh.haven-*/lib/arm64" \
+        "/data/data/com.mcpshell/lib"; do
+        # shellcheck disable=SC2086
+        for d in $candidate; do
+            if [ -f "$d/libproot-xed.so" ]; then
+                echo "$d"
+                return
+            fi
+        done
+    done
+    echo ""
+}
+
+BOX_BIN="${BOX_BIN:-$(detect_bin)}"
+
+PROOT="${BOX_BIN:+$BOX_BIN/libproot-xed.so}"
+PROOT_LOADER="${BOX_BIN:+$BOX_BIN/libproot.so}"
+PROOT_LOADER32="${BOX_BIN:+$BOX_BIN/libproot32.so}"
+TALLOC="${BOX_BIN:+$BOX_BIN/libtalloc.so}"
+BSDTAR="${BOX_BIN:+$BOX_BIN/libbsdtar.so}"
+
+# ── helpers ────────────────────────────────────────────────────────
+
+die() { echo "box: error: $*" >&2; exit 1; }
+warn() { echo "box: warning: $*" >&2; }
+info() { echo "box: $*"; }
+
+ensure_dirs() {
+    mkdir -p "$BOX_CONTAINERS" "$BOX_IMAGES" "$BOX_RUN" "$BOX_CACHE"
+}
+
+check_proot() {
+    [ -n "$PROOT" ] && [ -x "$PROOT" ] || die "proot binary not found. Set BOX_BIN or install Haven."
+}
+
+# Resolve volume shorthand variables
+resolve_volume() {
+    local vol="$1"
+    vol="${vol/\$DATA/$BOX_HOME}"
+    vol="${vol/\$EXT/$BOX_EXT}"
+    vol="${vol/\$CACHE/$BOX_CACHE}"
+    vol="${vol/\$HOME/$BOX_HOME}"
+    echo "$vol"
+}
+
+# Get container rootfs path
+container_rootfs() {
+    local name="$1"
+    local cdir="$BOX_CONTAINERS/$name"
+    if [ -L "$cdir/rootfs" ]; then
+        readlink -f "$cdir/rootfs"
+    elif [ -d "$cdir/rootfs" ]; then
+        echo "$cdir/rootfs"
+    else
+        echo ""
+    fi
+}
+
+# Check if container process is alive
+is_running() {
+    local name="$1"
+    local pidfile="$BOX_RUN/$name.pid"
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid=$(cat "$pidfile")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        # Stale pidfile
+        rm -f "$pidfile"
+    fi
+    return 1
+}
+
+# Read a value from container config
+config_get() {
+    local name="$1" key="$2"
+    local cfg="$BOX_CONTAINERS/$name/config"
+    [ -f "$cfg" ] || return 1
+    grep "^${key}=" "$cfg" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+# Write a value to container config
+config_set() {
+    local name="$1" key="$2" val="$3"
+    local cfg="$BOX_CONTAINERS/$name/config"
+    mkdir -p "$BOX_CONTAINERS/$name"
+    if [ -f "$cfg" ] && grep -q "^${key}=" "$cfg" 2>/dev/null; then
+        # Update existing key
+        local tmp="$cfg.tmp"
+        sed "s|^${key}=.*|${key}=${val}|" "$cfg" > "$tmp"
+        mv "$tmp" "$cfg"
+    else
+        echo "${key}=${val}" >> "$cfg"
+    fi
+}
+
+
+# ── proot command builder ──────────────────────────────────────────
+
+build_proot_cmd() {
+    local rootfs="$1"
+    local workdir="${2:-/root}"
+    shift 2
+
+    local cmd=""
+    cmd="$cmd $PROOT --kill-on-exit"
+    cmd="$cmd -0 --link2symlink --sysvipc -L"
+
+    # Root filesystem
+    cmd="$cmd -r $rootfs"
+
+    # System mounts (read-only, for linker/library compat)
+    for mnt in /apex /system /system_ext /vendor /product /odm \
+               /linkerconfig/ld.config.txt; do
+        [ -e "$mnt" ] && cmd="$cmd -b $mnt"
+    done
+
+    # Device/proc/sys
+    cmd="$cmd -b /dev -b /proc -b /sys"
+    cmd="$cmd -b /dev/urandom:/dev/random"
+    cmd="$cmd -b /proc/self/fd:/dev/fd"
+    cmd="$cmd -b /proc/self/fd/0:/dev/stdin"
+    cmd="$cmd -b /proc/self/fd/1:/dev/stdout"
+    cmd="$cmd -b /proc/self/fd/2:/dev/stderr"
+
+    # Tmp and shm
+    local tmpdir="$rootfs/tmp"
+    mkdir -p "$tmpdir"
+    cmd="$cmd -b $tmpdir:/dev/shm"
+
+    # FIPS stub (some packages check this)
+    local fips="$tmpdir/fips_enabled"
+    echo "0" > "$fips"
+    cmd="$cmd -b $fips:/proc/sys/crypto/fips_enabled"
+
+    # Working directory
+    cmd="$cmd -w $workdir"
+
+    echo "$cmd"
+}
+
+build_proot_env() {
+    local rootfs="$1"
+    local extra_env="$2"
+
+    # Base environment
+    echo "PROOT_TMP_DIR=$rootfs/tmp"
+    [ -n "$TALLOC" ] && [ -f "$TALLOC" ] && echo "LD_LIBRARY_PATH=$(dirname "$TALLOC")"
+    [ -n "$PROOT_LOADER" ] && [ -f "$PROOT_LOADER" ] && echo "PROOT_LOADER=$PROOT_LOADER"
+    [ -n "$PROOT_LOADER32" ] && [ -f "$PROOT_LOADER32" ] && echo "PROOT_LOADER32=$PROOT_LOADER32"
+    echo "PROOT_NO_SECCOMP=1"
+
+    # Extra env from config
+    if [ -n "$extra_env" ]; then
+        echo "$extra_env" | tr ' ' '\n' | grep '='
+    fi
+}
+
+# ── image management ───────────────────────────────────────────────
+
+cmd_images() {
+    ensure_dirs
+    info "REPOSITORY          SIZE        PATH"
+    for img_dir in "$BOX_IMAGES"/*/; do
+        [ -d "$img_dir" ] || continue
+        local name
+        name=$(basename "$img_dir")
+        local size
+        size=$(du -sh "$img_dir" 2>/dev/null | cut -f1)
+        printf "%-20s%-12s%s\n" "$name" "${size:-?}" "$img_dir"
+    done
+}
+
+cmd_pull() {
+    local image="${1:-}"
+    [ -n "$image" ] || die "usage: box pull <image>  (ubuntu or alpine)"
+
+    ensure_dirs
+    check_proot
+
+    local url="" archive_name="" strip=1
+    case "$image" in
+        ubuntu|ubuntu-24.04)
+            image="ubuntu"
+            url="https://github.com/xnet-admin-1/box/releases/download/rootfs-ubuntu-24.04.4/box-ubuntu-24.04-aarch64.tar.xz"
+            archive_name="rootfs.tar.xz"
+            ;;
+        alpine|alpine-3.21)
+            image="alpine"
+            url="https://github.com/xnet-admin-1/box/releases/download/rootfs-alpine-3.21.3/box-alpine-3.21-aarch64.tar.xz"
+            archive_name="rootfs.tar.xz"
+            ;;
+        *)
+            die "unknown image: $image (available: ubuntu, alpine)"
+            ;;
+    esac
+
+    local img_dir="$BOX_IMAGES/$image"
+    if [ -d "$img_dir/bin" ] || [ -d "$img_dir/usr" ]; then
+        info "$image already installed at $img_dir"
+        return 0
+    fi
+
+    mkdir -p "$img_dir"
+    local tarball="$BOX_CACHE/$archive_name"
+
+    info "pulling $image..."
+
+    # Download — use wget (toybox) with redirect following
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -O "$tarball" "$url" || die "download failed"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$tarball" "$url" || die "download failed"
+    else
+        die "no wget or curl available"
+    fi
+
+    info "extracting..."
+
+    # Extract using bsdtar
+    if [ -n "$BSDTAR" ] && [ -x "$BSDTAR" ]; then
+        LD_LIBRARY_PATH="$(dirname "$BSDTAR")" \
+            "$BSDTAR" -xf "$tarball" -C "$img_dir" --strip-components="$strip" 2>/dev/null
+        # bsdtar may exit 1 due to hardlink failures on Android — that's OK
+    else
+        # Fallback: try system tar (unlikely on stock Android)
+        tar xf "$tarball" -C "$img_dir" --strip-components="$strip" 2>/dev/null \
+            || die "extraction failed (no bsdtar or tar)"
+    fi
+
+    rm -f "$tarball"
+
+    # Basic patches
+    patch_rootfs "$image" "$img_dir"
+
+    info "$image ready ($(du -sh "$img_dir" | cut -f1))"
+}
+
+
+# ── rootfs patching ────────────────────────────────────────────────
+
+patch_rootfs() {
+    local image="$1" rootfs="$2"
+
+    # DNS
+    mkdir -p "$rootfs/etc"
+    echo "nameserver 8.8.8.8" > "$rootfs/etc/resolv.conf"
+    echo "nameserver 1.1.1.1" >> "$rootfs/etc/resolv.conf"
+
+    # Standard dirs
+    for d in tmp var/tmp home root root/.config; do
+        mkdir -p "$rootfs/$d"
+    done
+    chmod 1777 "$rootfs/tmp" 2>/dev/null
+
+    # Fix executable permissions on bin dirs
+    for d in bin sbin usr/bin usr/sbin usr/local/bin; do
+        if [ -d "$rootfs/$d" ]; then
+            find "$rootfs/$d" -type f -exec chmod +x {} \; 2>/dev/null
+        fi
+    done
+
+    # dpkg info scripts need +x for maintainer scripts
+    if [ -d "$rootfs/var/lib/dpkg/info" ]; then
+        find "$rootfs/var/lib/dpkg/info" -type f \( -name '*.postinst' -o -name '*.preinst' -o -name '*.postrm' -o -name '*.prerm' \) -exec chmod +x {} \; 2>/dev/null
+    fi
+
+    # ELF interpreters
+    for f in lib/ld-linux-aarch64.so.1 lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 \
+             usr/bin/env bin/sh bin/bash bin/dash; do
+        [ -f "$rootfs/$f" ] && chmod +x "$rootfs/$f" 2>/dev/null
+    done
+
+    # .so files need +x for proot
+    for d in lib usr/lib; do
+        if [ -d "$rootfs/$d" ]; then
+            find "$rootfs/$d" -name '*.so*' -type f -exec chmod +x {} \; 2>/dev/null
+        fi
+    done
+
+    # PRoot stubs — commands that fail under ptrace
+    local stub="#!/bin/sh\nexit 0\n"
+    for f in sbin/ldconfig usr/sbin/ldconfig usr/bin/ldconfig \
+             usr/sbin/invoke-rc.d sbin/start-stop-daemon usr/sbin/start-stop-daemon; do
+        local target="$rootfs/$f"
+        mkdir -p "$(dirname "$target")"
+        if [ -f "$target" ]; then
+            [ ! -f "${target}.real" ] && cp "$target" "${target}.real" 2>/dev/null
+        fi
+        printf '%b' "$stub" > "$target"
+        chmod +x "$target"
+    done
+
+    # Image-specific patches
+    case "$image" in
+        ubuntu)
+            patch_ubuntu "$rootfs"
+            ;;
+        alpine)
+            patch_alpine "$rootfs"
+            ;;
+    esac
+}
+
+patch_ubuntu() {
+    local rootfs="$1"
+
+    # Locale
+    local locale_gen="$rootfs/etc/locale.gen"
+    if [ -f "$locale_gen" ]; then
+        sed -i 's/^# *\(en_US.UTF-8\)/\1/' "$locale_gen" 2>/dev/null
+    fi
+
+    # apt: silent, no recommends
+    mkdir -p "$rootfs/etc/apt/apt.conf.d"
+    cat > "$rootfs/etc/apt/apt.conf.d/99-box" << 'EOF'
+APT::Get::Assume-Yes "true";
+APT::Get::Show-Upgraded "false";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+APT::Quiet "2";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+Acquire::Retries "3";
+Acquire::https::Timeout "30";
+Acquire::http::Timeout "30";
+APT::Sandbox::User "root";
+DPkg::Options {"--force-unsafe-io";};
+EOF
+
+    # dpkg: force-unsafe-io
+    mkdir -p "$rootfs/etc/dpkg/dpkg.cfg.d"
+    echo "force-unsafe-io" > "$rootfs/etc/dpkg/dpkg.cfg.d/99-box"
+    echo "force-confdef" >> "$rootfs/etc/dpkg/dpkg.cfg.d/99-box"
+    echo "force-confold" >> "$rootfs/etc/dpkg/dpkg.cfg.d/99-box"
+    echo "no-debsig" >> "$rootfs/etc/dpkg/dpkg.cfg.d/99-box"
+
+    # bashrc
+    cat > "$rootfs/root/.bashrc" << 'EOF'
+export TERM=xterm-256color
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export DEBIAN_FRONTEND=noninteractive
+export PS1='\u@box:\w\$ '
+alias ls='ls --color=auto'
+alias ll='ls -lah'
+alias apt='apt -qq'
+EOF
+
+    # profile
+    cat > "$rootfs/root/.profile" << 'EOF'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export DEBIAN_FRONTEND=noninteractive
+EOF
+}
+
+patch_alpine() {
+    local rootfs="$1"
+
+    # Alpine profile
+    cat > "$rootfs/root/.profile" << 'EOF'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LANG=C.UTF-8
+export TERM=xterm-256color
+export PS1='\u@box:\w\$ '
+EOF
+
+    # apk: no progress, no cache
+    mkdir -p "$rootfs/etc/apk"
+    if [ -f "$rootfs/etc/apk/repositories" ]; then
+        # Ensure community repo is enabled
+        if ! grep -q "community" "$rootfs/etc/apk/repositories" 2>/dev/null; then
+            local main_url
+            main_url=$(grep "main" "$rootfs/etc/apk/repositories" | head -1 | sed 's|/main|/community|')
+            [ -n "$main_url" ] && echo "$main_url" >> "$rootfs/etc/apk/repositories"
+        fi
+    fi
+}
+
+
+# ── container lifecycle ────────────────────────────────────────────
+
+cmd_run() {
+    local image="" name="" detach=0 workdir="/root" cmd_override=""
+    local volumes="" envvars="" ports=""
+
+    # Parse flags
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -d|--detach) detach=1; shift ;;
+            -n|--name) name="$2"; shift 2 ;;
+            -v|--volume) volumes="$volumes $(resolve_volume "$2")"; shift 2 ;;
+            -e|--env) envvars="$envvars $2"; shift 2 ;;
+            -p|--port) ports="$ports $2"; shift 2 ;;
+            -w|--workdir) workdir="$2"; shift 2 ;;
+            --) shift; cmd_override="$*"; break ;;
+            -*) die "unknown flag: $1" ;;
+            *)
+                if [ -z "$image" ]; then
+                    image="$1"; shift
+                else
+                    cmd_override="$*"; break
+                fi
+                ;;
+        esac
+    done
+
+    [ -n "$image" ] || die "usage: box run <image> [flags] [-- command...]"
+
+    ensure_dirs
+    check_proot
+
+    # Auto-generate name if not provided
+    if [ -z "$name" ]; then
+        name="${image}-$(date +%s | tail -c 5)"
+    fi
+
+    # Check not already running
+    is_running "$name" && die "container '$name' is already running"
+
+    # Ensure image exists
+    local img_dir="$BOX_IMAGES/$image"
+    if [ ! -d "$img_dir/bin" ] && [ ! -d "$img_dir/usr" ]; then
+        info "image '$image' not found locally, pulling..."
+        cmd_pull "$image"
+    fi
+
+    # Create container dir with its own rootfs copy or shared image
+    local cdir="$BOX_CONTAINERS/$name"
+    mkdir -p "$cdir"
+
+    # Rootfs strategy: first container on an image gets a symlink (shared).
+    # Additional containers get a full copy for isolation.
+    if [ ! -e "$cdir/rootfs" ]; then
+        local existing_users=0
+        for other in "$BOX_CONTAINERS"/*/; do
+            [ -d "$other" ] || continue
+            [ "$(basename "$other")" = "$name" ] && continue
+            local other_img
+            other_img=$(config_get "$(basename "$other")" "image")
+            [ "$other_img" = "$image" ] && existing_users=$((existing_users + 1))
+        done
+
+        if [ "$existing_users" -eq 0 ]; then
+            # First user — symlink to shared image
+            ln -sf "$img_dir" "$cdir/rootfs"
+        else
+            # Multiple users — full copy for isolation
+            info "copying rootfs for isolated container (background)..."
+            cp -a "$img_dir" "$cdir/rootfs"
+        fi
+    fi
+
+    local rootfs
+    rootfs=$(container_rootfs "$name")
+    [ -d "$rootfs" ] || die "rootfs not found for $name"
+
+    # Save config
+    config_set "$name" "image" "$image"
+    config_set "$name" "workdir" "$workdir"
+    config_set "$name" "volumes" "$volumes"
+    config_set "$name" "env" "$envvars"
+    config_set "$name" "ports" "$ports"
+    config_set "$name" "created" "$(date -Iseconds 2>/dev/null || date)"
+
+    # First-run distro setup (locale, etc.)
+    distro_setup "$name"
+
+    # Determine command
+    local shell_cmd
+    if [ -n "$cmd_override" ]; then
+        shell_cmd="$cmd_override"
+    elif [ -f "$rootfs/bin/bash" ]; then
+        shell_cmd="/bin/bash -l"
+    elif [ -f "$rootfs/bin/sh" ]; then
+        shell_cmd="/bin/sh -l"
+    else
+        shell_cmd="/bin/busybox sh -l"
+    fi
+
+    # Build proot command
+    local proot_cmd
+    proot_cmd=$(build_proot_cmd "$rootfs" "$workdir")
+
+    # Add volume binds
+    for vol in $volumes; do
+        local src="${vol%%:*}"
+        local dst="${vol#*:}"
+        [ -z "$dst" ] && dst="$src"
+        mkdir -p "$src" 2>/dev/null
+        proot_cmd="$proot_cmd -b $src:$dst"
+    done
+
+    # Build env
+    local env_file="$BOX_RUN/$name.env"
+    build_proot_env "$rootfs" "$envvars" > "$env_file"
+
+    # Inner env vars passed to the shell
+    local inner_env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    inner_env="$inner_env HOME=/root USER=root TERM=xterm-256color"
+    inner_env="$inner_env TMPDIR=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8"
+
+    if [ "$detach" -eq 1 ]; then
+        # Background mode
+        local logfile="$BOX_RUN/$name.log"
+
+        # Build the full command with env
+        local full_cmd="env"
+        while IFS= read -r line; do
+            [ -n "$line" ] && full_cmd="$full_cmd $line"
+        done < "$env_file"
+        full_cmd="$full_cmd $proot_cmd /usr/bin/env $inner_env $shell_cmd"
+
+        eval "$full_cmd" > "$logfile" 2>&1 &
+        local pid=$!
+        echo "$pid" > "$BOX_RUN/$name.pid"
+        config_set "$name" "status" "running"
+        config_set "$name" "pid" "$pid"
+        info "$name started (pid $pid)"
+    else
+        # Interactive mode
+        config_set "$name" "status" "running"
+
+        # Export proot env
+        while IFS= read -r line; do
+            [ -n "$line" ] && export "$line"
+        done < "$env_file"
+
+        # Run interactively
+        eval "$proot_cmd /usr/bin/env $inner_env $shell_cmd"
+        local exit_code=$?
+
+        config_set "$name" "status" "stopped"
+        rm -f "$BOX_RUN/$name.pid"
+        return $exit_code
+    fi
+}
+
+cmd_exec() {
+    local name=""
+
+    # First arg is container name, rest after -- is command
+    name="${1:-}"
+    [ -n "$name" ] || die "usage: box exec <name> [-- command...]"
+    shift
+
+    # Skip -- separator if present
+    [ "${1:-}" = "--" ] && shift
+
+    local cmd_override="$*"
+
+    ensure_dirs
+    check_proot
+
+    local rootfs
+    rootfs=$(container_rootfs "$name")
+    [ -d "$rootfs" ] || die "container '$name' not found"
+
+    local workdir
+    workdir=$(config_get "$name" "workdir")
+    workdir="${workdir:-/root}"
+
+    local volumes
+    volumes=$(config_get "$name" "volumes")
+
+    local envvars
+    envvars=$(config_get "$name" "env")
+
+    # Determine command
+    local shell_cmd
+    if [ -n "$cmd_override" ]; then
+        shell_cmd="$cmd_override"
+    elif [ -f "$rootfs/bin/bash" ]; then
+        shell_cmd="/bin/bash -l"
+    elif [ -f "$rootfs/bin/sh" ]; then
+        shell_cmd="/bin/sh -l"
+    else
+        shell_cmd="/bin/busybox sh -l"
+    fi
+
+    # Build proot command
+    local proot_cmd
+    proot_cmd=$(build_proot_cmd "$rootfs" "$workdir")
+
+    # Add volume binds
+    for vol in $volumes; do
+        local src="${vol%%:*}"
+        local dst="${vol#*:}"
+        [ -z "$dst" ] && dst="$src"
+        proot_cmd="$proot_cmd -b $src:$dst"
+    done
+
+    # Export proot env
+    local env_file="$BOX_RUN/$name.env"
+    build_proot_env "$rootfs" "$envvars" > "$env_file"
+    while IFS= read -r line; do
+        [ -n "$line" ] && export "$line"
+    done < "$env_file"
+
+    local inner_env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    inner_env="$inner_env HOME=/root USER=root TERM=xterm-256color"
+    inner_env="$inner_env TMPDIR=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8"
+
+    eval "$proot_cmd /usr/bin/env $inner_env $shell_cmd"
+}
+
+cmd_stop() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: box stop <name>"
+
+    if is_running "$name"; then
+        local pid
+        pid=$(cat "$BOX_RUN/$name.pid")
+        kill "$pid" 2>/dev/null
+        # Give it a moment, then force
+        sleep 1
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        rm -f "$BOX_RUN/$name.pid"
+        config_set "$name" "status" "stopped"
+        info "$name stopped"
+    else
+        info "$name is not running"
+    fi
+}
+
+cmd_rm() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: box rm <name>"
+
+    # Stop if running
+    is_running "$name" && cmd_stop "$name"
+
+    local cdir="$BOX_CONTAINERS/$name"
+    if [ -d "$cdir" ]; then
+        rm -rf "$cdir"
+        rm -f "$BOX_RUN/$name.pid" "$BOX_RUN/$name.log" "$BOX_RUN/$name.env"
+        info "$name removed"
+    else
+        die "container '$name' not found"
+    fi
+}
+
+cmd_ps() {
+    ensure_dirs
+    printf "%-16s %-10s %-8s %-6s %s\n" "NAME" "IMAGE" "STATUS" "PID" "PORTS"
+
+    for cdir in "$BOX_CONTAINERS"/*/; do
+        [ -d "$cdir" ] || continue
+        local name
+        name=$(basename "$cdir")
+        local image
+        image=$(config_get "$name" "image")
+        local ports
+        ports=$(config_get "$name" "ports")
+        local status="stopped"
+        local pid="-"
+
+        if is_running "$name"; then
+            status="running"
+            pid=$(cat "$BOX_RUN/$name.pid" 2>/dev/null)
+        fi
+
+        printf "%-16s %-10s %-8s %-6s %s\n" "$name" "${image:-?}" "$status" "$pid" "${ports:-}"
+    done
+}
+
+cmd_logs() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: box logs <name>"
+
+    local logfile="$BOX_RUN/$name.log"
+    if [ -f "$logfile" ]; then
+        cat "$logfile"
+    else
+        info "no logs for $name"
+    fi
+}
+
+cmd_inspect() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: box inspect <name>"
+
+    local cfg="$BOX_CONTAINERS/$name/config"
+    [ -f "$cfg" ] || die "container '$name' not found"
+
+    cat "$cfg"
+    echo ""
+    echo "rootfs=$(container_rootfs "$name")"
+    if is_running "$name"; then
+        echo "running=true"
+        echo "pid=$(cat "$BOX_RUN/$name.pid" 2>/dev/null)"
+    else
+        echo "running=false"
+    fi
+}
+
+
+# ── Boxfile (compose) ──────────────────────────────────────────────
+
+# Parse a Boxfile — line-based, Dockerfile-style format.
+# Supports multiple services separated by SERVICE directives.
+#
+# Format:
+#   SERVICE <name>
+#   FROM <image>
+#   PACKAGES <pkg1> <pkg2> ...
+#   ENV <KEY=VALUE>
+#   EXPOSE <port1> <port2> ...
+#   VOLUME <host:container>
+#   WORKDIR <path>
+#   CMD <command>
+
+parse_boxfile() {
+    local boxfile="$1"
+    [ -f "$boxfile" ] || die "Boxfile not found: $boxfile"
+
+    local current_service=""
+    local default_service="default"
+    local services=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Strip comments and leading/trailing whitespace
+        line="${line%%#*}"
+        case "$line" in
+            ""|" "*) continue ;;
+        esac
+        # Trim leading whitespace
+        line=$(echo "$line" | sed 's/^[[:space:]]*//')
+        [ -z "$line" ] && continue
+
+        local keyword="${line%% *}"
+        local value="${line#* }"
+        # If no space, value equals keyword (single-word line)
+        [ "$keyword" = "$value" ] && value=""
+
+        case "$keyword" in
+            SERVICE)
+                current_service="$value"
+                services="$services $current_service"
+                ;;
+            FROM)
+                local svc="${current_service:-$default_service}"
+                [ -z "$current_service" ] && services="$services $svc" && current_service="$svc"
+                config_set "__boxfile_$svc" "image" "$value"
+                ;;
+            PACKAGES)
+                local svc="${current_service:-$default_service}"
+                config_set "__boxfile_$svc" "packages" "$value"
+                ;;
+            ENV)
+                local svc="${current_service:-$default_service}"
+                local prev
+                prev=$(config_get "__boxfile_$svc" "env")
+                config_set "__boxfile_$svc" "env" "${prev:+$prev }$value"
+                ;;
+            EXPOSE)
+                local svc="${current_service:-$default_service}"
+                local prev
+                prev=$(config_get "__boxfile_$svc" "ports")
+                config_set "__boxfile_$svc" "ports" "${prev:+$prev }$value"
+                ;;
+            VOLUME)
+                local svc="${current_service:-$default_service}"
+                local prev
+                prev=$(config_get "__boxfile_$svc" "volumes")
+                config_set "__boxfile_$svc" "volumes" "${prev:+$prev }$(resolve_volume "$value")"
+                ;;
+            WORKDIR)
+                local svc="${current_service:-$default_service}"
+                config_set "__boxfile_$svc" "workdir" "$value"
+                ;;
+            CMD)
+                local svc="${current_service:-$default_service}"
+                config_set "__boxfile_$svc" "cmd" "$value"
+                ;;
+            *)
+                warn "unknown directive in Boxfile: $keyword"
+                ;;
+        esac
+    done < "$boxfile"
+
+    echo "$services"
+}
+
+cmd_up() {
+    local boxfile="${1:-Boxfile}"
+    [ -f "$boxfile" ] || die "no Boxfile found (looked for: $boxfile)"
+
+    ensure_dirs
+    check_proot
+
+    info "reading $boxfile..."
+    local services
+    services=$(parse_boxfile "$boxfile")
+
+    for svc in $services; do
+        local image packages cmd_str volumes envvars ports workdir
+        image=$(config_get "__boxfile_$svc" "image")
+        packages=$(config_get "__boxfile_$svc" "packages")
+        cmd_str=$(config_get "__boxfile_$svc" "cmd")
+        volumes=$(config_get "__boxfile_$svc" "volumes")
+        envvars=$(config_get "__boxfile_$svc" "env")
+        ports=$(config_get "__boxfile_$svc" "ports")
+        workdir=$(config_get "__boxfile_$svc" "workdir")
+
+        [ -n "$image" ] || { warn "service '$svc' has no FROM, skipping"; continue; }
+
+        info "starting $svc ($image)..."
+
+        # Build run args
+        local run_args="-d -n $svc"
+        [ -n "$workdir" ] && run_args="$run_args -w $workdir"
+        for vol in $volumes; do
+            run_args="$run_args -v $vol"
+        done
+        for env in $envvars; do
+            run_args="$run_args -e $env"
+        done
+        for port in $ports; do
+            run_args="$run_args -p $port"
+        done
+
+        # Determine command — if packages needed, run install first then CMD
+        local final_cmd
+        if [ -n "$packages" ]; then
+            local pkg_cmd
+            case "$image" in
+                ubuntu*) pkg_cmd="apt-get update -qq && apt-get install -y -qq $packages" ;;
+                alpine*) pkg_cmd="apk update && apk add --no-cache $packages" ;;
+                *) pkg_cmd="echo 'unknown package manager for $image'" ;;
+            esac
+
+            local pkg_marker="$BOX_CONTAINERS/$svc/.packages_installed"
+            if [ -f "$pkg_marker" ] && [ "$(cat "$pkg_marker" 2>/dev/null)" = "$packages" ]; then
+                # Packages already installed
+                final_cmd="${cmd_str:-/bin/sh -l}"
+            else
+                # Install packages then run command
+                if [ -n "$cmd_str" ]; then
+                    final_cmd="$pkg_cmd && exec $cmd_str"
+                else
+                    final_cmd="$pkg_cmd"
+                fi
+                # Write marker after successful start (in container dir, not rootfs)
+                # This is a best-effort — if packages fail, marker won't exist
+                echo "$packages" > "$BOX_CONTAINERS/$svc/.packages_installed"
+            fi
+        else
+            final_cmd="${cmd_str:-/bin/sh -l}"
+        fi
+
+        # Stop existing if running
+        is_running "$svc" && cmd_stop "$svc"
+
+        # Run
+        eval "cmd_run $image $run_args -- $final_cmd"
+
+        # Clean up temp boxfile config
+        rm -f "$BOX_CONTAINERS/__boxfile_$svc/config"
+        rmdir "$BOX_CONTAINERS/__boxfile_$svc" 2>/dev/null
+    done
+
+    info "all services started"
+    cmd_ps
+}
+
+cmd_down() {
+    local boxfile="${1:-Boxfile}"
+
+    if [ -f "$boxfile" ]; then
+        local services
+        services=$(parse_boxfile "$boxfile")
+        for svc in $services; do
+            is_running "$svc" && cmd_stop "$svc"
+            # Clean up temp boxfile config
+            rm -f "$BOX_CONTAINERS/__boxfile_$svc/config"
+            rmdir "$BOX_CONTAINERS/__boxfile_$svc" 2>/dev/null
+        done
+    else
+        # No Boxfile — stop everything
+        info "no Boxfile, stopping all containers..."
+        for cdir in "$BOX_CONTAINERS"/*/; do
+            [ -d "$cdir" ] || continue
+            local name
+            name=$(basename "$cdir")
+            case "$name" in __boxfile_*) continue ;; esac
+            is_running "$name" && cmd_stop "$name"
+        done
+    fi
+
+    info "all services stopped"
+}
+
+# ── distro setup ───────────────────────────────────────────────────
+
+# Run first-time distro setup inside a container's rootfs.
+# Called automatically on first 'box run' or manually via 'box setup'.
+distro_setup() {
+    local name="$1"
+    local rootfs
+    rootfs=$(container_rootfs "$name")
+    [ -d "$rootfs" ] || return 1
+
+    local marker="$BOX_CONTAINERS/$name/.distro_setup_done"
+    [ -f "$marker" ] && return 0
+
+    local image
+    image=$(config_get "$name" "image")
+
+    case "$image" in
+        ubuntu*)
+            info "running distro setup (locale)..."
+            # Run dpkg-reconfigure locales inside proot
+            run_in_proot "$rootfs" "DEBIAN_FRONTEND=noninteractive dpkg-reconfigure locales 2>/dev/null || true"
+            ;;
+        alpine*)
+            # Alpine doesn't need locale setup — musl uses C.UTF-8 natively
+            ;;
+    esac
+
+    echo "done" > "$marker"
+}
+
+# Run a one-shot command inside a rootfs via proot (non-interactive)
+run_in_proot() {
+    local rootfs="$1"
+    local command="$2"
+    local timeout="${3:-60}"
+
+    check_proot
+
+    local proot_cmd
+    proot_cmd=$(build_proot_cmd "$rootfs" "/root")
+
+    local env_file="$BOX_CACHE/.tmp_env"
+    build_proot_env "$rootfs" "" > "$env_file"
+
+    # Export proot env
+    while IFS= read -r line; do
+        [ -n "$line" ] && export "$line"
+    done < "$env_file"
+
+    local inner_env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    inner_env="$inner_env HOME=/root USER=root TERM=xterm-256color"
+    inner_env="$inner_env TMPDIR=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8"
+
+    eval "$proot_cmd /usr/bin/env $inner_env /bin/sh -c '$command'" 2>/dev/null
+    rm -f "$env_file"
+}
+
+cmd_setup() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: box setup <name>"
+
+    local rootfs
+    rootfs=$(container_rootfs "$name")
+    [ -d "$rootfs" ] || die "container '$name' not found"
+
+    # Force re-run by removing marker
+    rm -f "$BOX_CONTAINERS/$name/.distro_setup_done"
+    distro_setup "$name"
+    info "setup complete for $name"
+}
+
+# ── help ───────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat << 'EOF'
+box — container runtime for Android (PRoot-based, no root)
+
+Usage: box <command> [args...]
+
+Container commands:
+  run <image> [flags] [-- cmd]   Create and start a container
+    -n, --name <name>            Container name (auto-generated if omitted)
+    -d, --detach                 Run in background
+    -v, --volume <host:guest>    Bind mount ($DATA, $EXT, $CACHE shortcuts)
+    -e, --env <KEY=VALUE>        Environment variable
+    -p, --port <port>            Expose port (metadata only, mirrored networking)
+    -w, --workdir <path>         Working directory inside container
+
+  exec <name> [-- cmd]           Run command in existing container
+  stop <name>                    Stop a running container
+  rm <name>                      Remove a container
+  ps                             List containers
+  logs <name>                    Show container output (detached mode)
+  inspect <name>                 Show container config
+  setup <name>                   Run distro setup (locale, etc.)
+
+Image commands:
+  images                         List installed rootfs images
+  pull <image>                   Download rootfs (ubuntu, alpine)
+
+Compose commands:
+  up [boxfile]                   Start services from Boxfile (default: ./Boxfile)
+  down [boxfile]                 Stop services from Boxfile
+
+Volume shortcuts:
+  $DATA    → app filesDir/box
+  $EXT     → app-scoped external storage
+  $CACHE   → app cacheDir/box
+
+Examples:
+  box pull alpine
+  box run alpine -n dev -- sh -l
+  box run ubuntu -d -n webserver -- python3 -m http.server 8080
+  box exec dev -- apk add python3
+  box ps
+  box up Boxfile
+  box down
+
+EOF
+}
+
+# ── main dispatch ──────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        run)     cmd_run "$@" ;;
+        exec)    cmd_exec "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        rm)      cmd_rm "$@" ;;
+        ps)      cmd_ps "$@" ;;
+        logs)    cmd_logs "$@" ;;
+        inspect) cmd_inspect "$@" ;;
+        images)  cmd_images "$@" ;;
+        pull)    cmd_pull "$@" ;;
+        up)      cmd_up "$@" ;;
+        down)    cmd_down "$@" ;;
+        setup)   cmd_setup "$@" ;;
+        help|-h|--help) cmd_help ;;
+        version|-v|--version) echo "box $VERSION" ;;
+        *)       die "unknown command: $cmd (try 'box help')" ;;
+    esac
+}
+
+main "$@"

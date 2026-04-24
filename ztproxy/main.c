@@ -45,6 +45,39 @@ static char g_zt_addr[64];
 static uint8_t g_upstream_ip[4];
 static uint16_t g_upstream_port = 0;
 static sem_t g_conn_sem;
+static pthread_mutex_t g_zts_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Thread-safe wrappers for zts calls */
+static int safe_zts_socket(int af, int type, int proto) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_socket(af, type, proto);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
+static int safe_zts_connect(int fd, const struct sockaddr *sa, int len) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_connect(fd, sa, len);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
+static int safe_zts_send(int fd, const void *buf, int len, int flags) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_send(fd, buf, len, flags);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
+static int safe_zts_recv(int fd, void *buf, int len, int flags) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_recv(fd, buf, len, flags);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
+static int safe_zts_close(int fd) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_close(fd);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
 
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
@@ -66,7 +99,7 @@ static void *relay_zt_to_local(void *arg) {
     struct relay_ctx *r = (struct relay_ctx *)arg;
     uint8_t rbuf[BUF_SIZE];
     while (1) {
-        int n = zts_recv(r->from_fd, rbuf, sizeof(rbuf), 0);
+        int n = safe_zts_recv(r->from_fd, rbuf, sizeof(rbuf), 0);
         if (n <= 0) break;
         int sent = 0;
         while (sent < n) {
@@ -151,7 +184,7 @@ static void *socks5_thread(void *arg) {
         connect_port = dst_port;
     }
 
-    int zt_fd = zts_socket(AF_INET, SOCK_STREAM, 0);
+    int zt_fd = safe_zts_socket(AF_INET, SOCK_STREAM, 0);
     if (zt_fd < 0) {
         buf[0] = 0x05; buf[1] = 0x01; memset(buf+2, 0, 8);
         send(cfd, buf, 10, 0);
@@ -167,9 +200,9 @@ static void *socks5_thread(void *arg) {
     lwip_sa[3] = connect_port & 0xff;
     memcpy(&lwip_sa[4], connect_ip, 4);
 
-    if (zts_connect(zt_fd, (struct sockaddr *)lwip_sa, 16) < 0) {
+    if (safe_zts_connect(zt_fd, (struct sockaddr *)lwip_sa, 16) < 0) {
         ERR("zt connect %s:%d failed", dst_str, dst_port);
-        zts_close(zt_fd);
+        safe_zts_close(zt_fd);
         buf[0] = 0x05; buf[1] = 0x05; memset(buf+2, 0, 8);
         send(cfd, buf, 10, 0);
         goto done;
@@ -184,9 +217,9 @@ static void *socks5_thread(void *arg) {
     if (g_upstream_port) {
         /* greeting */
         buf[0] = 0x05; buf[1] = 1; buf[2] = 0;
-        zts_send(zt_fd, buf, 3, 0);
-        if (zts_recv(zt_fd, buf, 2, 0) < 2 || buf[1] != 0) {
-            ERR("upstream auth failed"); zts_close(zt_fd); goto done;
+        safe_zts_send(zt_fd, buf, 3, 0);
+        if (safe_zts_recv(zt_fd, buf, 2, 0) < 2 || buf[1] != 0) {
+            ERR("upstream auth failed"); safe_zts_close(zt_fd); goto done;
         }
         /* CONNECT request */
         buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00;
@@ -199,10 +232,10 @@ static void *socks5_thread(void *arg) {
         }
         uint16_t np = htons(dst_port);
         memcpy(buf + reqlen, &np, 2); reqlen += 2;
-        zts_send(zt_fd, buf, reqlen, 0);
-        if (zts_recv(zt_fd, buf, 10, 0) < 4 || buf[1] != 0) {
+        safe_zts_send(zt_fd, buf, reqlen, 0);
+        if (safe_zts_recv(zt_fd, buf, 10, 0) < 4 || buf[1] != 0) {
             ERR("upstream connect %s:%d failed", dst_str, dst_port);
-            zts_close(zt_fd); goto done;
+            safe_zts_close(zt_fd); goto done;
         }
     }
 
@@ -224,14 +257,14 @@ static void *socks5_thread(void *arg) {
         if (n <= 0) break;
         int sent = 0;
         while (sent < n) {
-            int w = zts_send(zt_fd, buf + sent, n - sent, 0);
+            int w = safe_zts_send(zt_fd, buf + sent, n - sent, 0);
             if (w <= 0) goto proxy_done;
             sent += w;
         }
     }
 
 proxy_done:
-    zts_close(zt_fd);
+    safe_zts_close(zt_fd);
 done:
     close(cfd);
     sem_post(&g_conn_sem);

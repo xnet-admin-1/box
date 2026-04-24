@@ -40,6 +40,8 @@
 static volatile int g_running = 1;
 static volatile int g_online = 0;
 static char g_zt_addr[64];
+static uint8_t g_upstream_ip[4];
+static uint16_t g_upstream_port = 0;
 
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
@@ -103,28 +105,47 @@ static void *socks5_thread(void *arg) {
     uint8_t dst_ip[4];
     uint16_t dst_port;
     char dst_str[256];
+    uint8_t domain_buf[260]; /* for atyp=3: len + domain */
+    int domain_len = 0;
 
     if (atyp == 0x01) { /* IPv4 */
         recv(cfd, dst_ip, 4, 0);
         recv(cfd, &dst_port, 2, 0);
         dst_port = ntohs(dst_port);
         snprintf(dst_str, sizeof(dst_str), "%d.%d.%d.%d", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
-    } else if (atyp == 0x03) { /* Domain — resolve not supported, reject */
+    } else if (atyp == 0x03) { /* Domain */
         uint8_t dlen;
         recv(cfd, &dlen, 1, 0);
-        recv(cfd, buf, dlen, 0);
+        recv(cfd, domain_buf + 1, dlen, 0);
+        domain_buf[0] = dlen;
+        domain_len = 1 + dlen;
         recv(cfd, &dst_port, 2, 0);
-        buf[0] = 0x05; buf[1] = 0x04; /* host unreachable */
-        memset(buf+2, 0, 8);
-        send(cfd, buf, 10, 0);
-        goto done;
+        dst_port = ntohs(dst_port);
+        memcpy(dst_str, domain_buf + 1, dlen);
+        dst_str[dlen] = 0;
+        if (!g_upstream_port) {
+            /* No upstream — can't resolve domains */
+            buf[0] = 0x05; buf[1] = 0x04; memset(buf+2, 0, 8);
+            send(cfd, buf, 10, 0);
+            goto done;
+        }
     } else {
         goto done;
     }
 
     LOG("SOCKS5 CONNECT %s:%d", dst_str, dst_port);
 
-    /* Connect via libzt */
+    /* Connect via libzt — to upstream SOCKS5 or directly */
+    uint8_t connect_ip[4];
+    uint16_t connect_port;
+    if (g_upstream_port) {
+        memcpy(connect_ip, g_upstream_ip, 4);
+        connect_port = g_upstream_port;
+    } else {
+        memcpy(connect_ip, dst_ip, 4);
+        connect_port = dst_port;
+    }
+
     int zt_fd = zts_socket(AF_INET, SOCK_STREAM, 0);
     if (zt_fd < 0) {
         buf[0] = 0x05; buf[1] = 0x01; memset(buf+2, 0, 8);
@@ -137,9 +158,9 @@ static void *socks5_thread(void *arg) {
     memset(lwip_sa, 0, 16);
     lwip_sa[0] = 16;
     lwip_sa[1] = AF_INET;
-    lwip_sa[2] = (dst_port >> 8) & 0xff;
-    lwip_sa[3] = dst_port & 0xff;
-    memcpy(&lwip_sa[4], dst_ip, 4);
+    lwip_sa[2] = (connect_port >> 8) & 0xff;
+    lwip_sa[3] = connect_port & 0xff;
+    memcpy(&lwip_sa[4], connect_ip, 4);
 
     if (zts_connect(zt_fd, (struct sockaddr *)lwip_sa, 16) < 0) {
         ERR("zt connect %s:%d failed", dst_str, dst_port);
@@ -153,6 +174,32 @@ static void *socks5_thread(void *arg) {
     buf[0] = 0x05; buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x01;
     memset(buf+4, 0, 6);
     send(cfd, buf, 10, 0);
+
+    /* If upstream, do SOCKS5 handshake with upstream */
+    if (g_upstream_port) {
+        /* greeting */
+        buf[0] = 0x05; buf[1] = 1; buf[2] = 0;
+        zts_send(zt_fd, buf, 3, 0);
+        if (zts_recv(zt_fd, buf, 2, 0) < 2 || buf[1] != 0) {
+            ERR("upstream auth failed"); zts_close(zt_fd); goto done;
+        }
+        /* CONNECT request */
+        buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00;
+        buf[3] = atyp;
+        int reqlen = 4;
+        if (atyp == 0x01) {
+            memcpy(buf + 4, dst_ip, 4); reqlen += 4;
+        } else if (atyp == 0x03) {
+            memcpy(buf + 4, domain_buf, domain_len); reqlen += domain_len;
+        }
+        uint16_t np = htons(dst_port);
+        memcpy(buf + reqlen, &np, 2); reqlen += 2;
+        zts_send(zt_fd, buf, reqlen, 0);
+        if (zts_recv(zt_fd, buf, 10, 0) < 4 || buf[1] != 0) {
+            ERR("upstream connect %s:%d failed", dst_str, dst_port);
+            zts_close(zt_fd); goto done;
+        }
+    }
 
     LOG("proxying %s:%d", dst_str, dst_port);
 
@@ -221,19 +268,26 @@ int main(int argc, char **argv) {
     int local_controller = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:n:P:s:l")) != -1) {
+    while ((opt = getopt(argc, argv, "p:n:P:s:lu:")) != -1) {
         switch (opt) {
             case 'p': zt_path = optarg; break;
             case 'n': nwid = strtoull(optarg, NULL, 16); break;
             case 'P': zt_port = atoi(optarg); break;
             case 's': socks_port = atoi(optarg); break;
             case 'l': local_controller = 1; break;
+            case 'u': {
+                char tmp[64];
+                strncpy(tmp, optarg, sizeof(tmp)-1);
+                char *colon = strrchr(tmp, ':');
+                if (colon) { *colon = 0; inet_pton(AF_INET, tmp, g_upstream_ip); g_upstream_port = atoi(colon+1); }
+                break;
+            }
             default: goto usage;
         }
     }
     if (!zt_path || (!nwid && !local_controller) || !socks_port) {
 usage:
-        fprintf(stderr, "usage: ztproxy -p <path> -n <nwid> -s <socks-port> [-P zt-port]\n"
+        fprintf(stderr, "usage: ztproxy -p <path> -n <nwid> -s <socks-port> [-u upstream:port] [-P zt-port]\n"
                         "       ztproxy -p <path> -l -s <socks-port> [-P zt-port]\n");
         return 1;
     }

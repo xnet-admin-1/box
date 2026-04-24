@@ -86,10 +86,10 @@ jobs:
           ln -sf "$CC" /tmp/mock-bin/cc
           export PATH="/tmp/mock-bin:$PATH"
 
+          export LDFLAGS="-Wl,-z,max-page-size=16384"
           ./configure --prefix=/tmp/talloc-install \
             --disable-rpath --disable-python \
-            --cross-compile --cross-answers=cross-answers.txt \
-            --extra-ldflags="-Wl,-z,max-page-size=16384"
+            --cross-compile --cross-answers=cross-answers.txt
           make -j$(nproc)
 
           mkdir -p /tmp/talloc-out/{include,lib}

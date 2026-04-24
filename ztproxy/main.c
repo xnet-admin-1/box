@@ -61,16 +61,10 @@ static int safe_zts_connect(int fd, const struct sockaddr *sa, int len) {
     return r;
 }
 static int safe_zts_send(int fd, const void *buf, int len, int flags) {
-    pthread_mutex_lock(&g_zts_lock);
-    int r = zts_send(fd, buf, len, flags);
-    pthread_mutex_unlock(&g_zts_lock);
-    return r;
+    return zts_send(fd, buf, len, flags);
 }
 static int safe_zts_recv(int fd, void *buf, int len, int flags) {
-    pthread_mutex_lock(&g_zts_lock);
-    int r = zts_recv(fd, buf, len, flags);
-    pthread_mutex_unlock(&g_zts_lock);
-    return r;
+    return zts_recv(fd, buf, len, flags);
 }
 static int safe_zts_close(int fd) {
     pthread_mutex_lock(&g_zts_lock);

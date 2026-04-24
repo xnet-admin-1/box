@@ -304,32 +304,40 @@ static void on_upstream_req(struct conn *c) {
 
 /* Relay data */
 static void relay_step(struct conn *c, int client_readable) {
-    /* Client → ZT: read from client if buffer empty */
-    if (client_readable && c->c2z_len == 0) {
-        int n = recv(c->cfd, c->c2z, BUF_SIZE, MSG_DONTWAIT);
-        if (n == 0) { free_conn(c); return; }
-        if (n > 0) { c->c2z_len = n; c->c2z_off = 0; }
+    /* Client → ZT */
+    for (;;) {
+        if (c->c2z_len == 0) {
+            int n = recv(c->cfd, c->c2z, BUF_SIZE, MSG_DONTWAIT);
+            if (n == 0) { free_conn(c); return; }
+            if (n < 0) break;
+            c->c2z_len = n; c->c2z_off = 0;
+        }
+        while (c->c2z_off < c->c2z_len) {
+            int w = zts_send(c->zfd, c->c2z + c->c2z_off, c->c2z_len - c->c2z_off, MSG_DONTWAIT);
+            if (w <= 0) goto c2z_done;
+            c->c2z_off += w;
+        }
+        c->c2z_len = 0; c->c2z_off = 0;
     }
-    /* Drain c2z buffer to zts */
-    while (c->c2z_off < c->c2z_len) {
-        int w = zts_send(c->zfd, c->c2z + c->c2z_off, c->c2z_len - c->c2z_off, MSG_DONTWAIT);
-        if (w <= 0) break;
-        c->c2z_off += w;
-    }
+c2z_done:
     if (c->c2z_off == c->c2z_len) { c->c2z_len = 0; c->c2z_off = 0; }
 
-    /* ZT → Client: read from zts if buffer empty */
-    if (c->z2c_len == 0) {
-        int n = zts_recv(c->zfd, c->z2c, BUF_SIZE, MSG_DONTWAIT);
-        if (n == 0) { free_conn(c); return; }
-        if (n > 0) { c->z2c_len = n; c->z2c_off = 0; }
+    /* ZT → Client */
+    for (;;) {
+        if (c->z2c_len == 0) {
+            int n = zts_recv(c->zfd, c->z2c, BUF_SIZE, MSG_DONTWAIT);
+            if (n == 0) { free_conn(c); return; }
+            if (n < 0) break;
+            c->z2c_len = n; c->z2c_off = 0;
+        }
+        while (c->z2c_off < c->z2c_len) {
+            int w = send(c->cfd, c->z2c + c->z2c_off, c->z2c_len - c->z2c_off, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (w <= 0) goto z2c_done;
+            c->z2c_off += w;
+        }
+        c->z2c_len = 0; c->z2c_off = 0;
     }
-    /* Drain z2c buffer to client */
-    while (c->z2c_off < c->z2c_len) {
-        int w = send(c->cfd, c->z2c + c->z2c_off, c->z2c_len - c->z2c_off, MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (w <= 0) break;
-        c->z2c_off += w;
-    }
+z2c_done:
     if (c->z2c_off == c->z2c_len) { c->z2c_len = 0; c->z2c_off = 0; }
 }
 
@@ -457,7 +465,7 @@ usage:
 
     while (g_running) {
         /* Short timeout so we can poll zts sockets */
-        int nev = epoll_wait(epfd, events, 64, 5);
+        int nev = epoll_wait(epfd, events, 64, 1);
 
         for (int i = 0; i < nev; i++) {
             struct conn *c = events[i].data.ptr;

@@ -23,6 +23,9 @@ export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
 export OBJCOPY="$TOOLCHAIN/bin/llvm-objcopy"
 export OBJDUMP="$TOOLCHAIN/bin/llvm-objdump"
 
+# 16KB page alignment for Android 15+
+export LDFLAGS="-Wl,-z,max-page-size=16384"
+
 BUILD="/tmp/box-build"
 OUT="$BUILD/out/arm64-v8a"
 mkdir -p "$BUILD" "$OUT"
@@ -110,6 +113,8 @@ cmake -S "libarchive-$LIBARCHIVE_VERSION" -B "$BUILD/libarchive-build" \
     -DCMAKE_ANDROID_STL_TYPE=c++_static \
     -DCMAKE_SYSTEM_VERSION=$ANDROID_API \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384" \
+    -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384" \
     -DCMAKE_INSTALL_PREFIX="$BUILD/libarchive-install" \
     -DENABLE_TEST=OFF \
     -DENABLE_TAR=ON \
@@ -141,7 +146,7 @@ fi
 cd proot/src
 
 export CFLAGS="-I$BUILD/talloc-out/include"
-export LDFLAGS="-L$BUILD/talloc-out/lib"
+export LDFLAGS="-L$BUILD/talloc-out/lib -Wl,-z,max-page-size=16384"
 export PROOT_UNBUNDLE_LOADER="../libexec/proot"
 
 make distclean 2>/dev/null || true

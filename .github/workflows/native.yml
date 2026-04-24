@@ -167,6 +167,9 @@ jobs:
             sed -i '1i #include <string.h>' extension/ashmem_memfd/ashmem_memfd.c
           fi
 
+          # 16KB page alignment for loaders
+          sed -i 's/LOADER_LDFLAGS$1 += -static/LOADER_LDFLAGS$1 += -static -Wl,-z,max-page-size=16384/' GNUmakefile
+
           make V=1 PREFIX=/tmp/proot-install install
           "$STRIP" /tmp/proot-install/bin/proot
           find /tmp/proot/libexec -type f | xargs "$STRIP" 2>/dev/null || true

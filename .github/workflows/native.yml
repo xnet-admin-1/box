@@ -88,8 +88,9 @@ jobs:
 
           ./configure --prefix=/tmp/talloc-install \
             --disable-rpath --disable-python \
-            --cross-compile --cross-answers=cross-answers.txt
-          LDFLAGS="-Wl,-z,max-page-size=16384" make -j$(nproc)
+            --cross-compile --cross-answers=cross-answers.txt \
+            --extra-ldflags="-Wl,-z,max-page-size=16384"
+          make -j$(nproc)
 
           mkdir -p /tmp/talloc-out/{include,lib}
           "$AR" rcs /tmp/talloc-out/lib/libtalloc.a bin/default/talloc.c.5.o bin/default/lib/replace/replace.c.1.o bin/default/lib/replace/closefrom.c.1.o

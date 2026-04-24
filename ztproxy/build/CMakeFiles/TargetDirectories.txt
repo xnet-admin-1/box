@@ -1,0 +1,3 @@
+/home/xnet-admin/projects/box/ztproxy/build/CMakeFiles/ztproxy.dir
+/home/xnet-admin/projects/box/ztproxy/build/CMakeFiles/edit_cache.dir
+/home/xnet-admin/projects/box/ztproxy/build/CMakeFiles/rebuild_cache.dir

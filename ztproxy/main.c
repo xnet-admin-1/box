@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <android/log.h>
+#include <semaphore.h>
 
 #include "ZeroTier.h"
 
@@ -36,12 +37,14 @@
 #define ERR(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, TAG, fmt, ##__VA_ARGS__)
 
 #define BUF_SIZE 16384
+#define MAX_CONCURRENT 8
 
 static volatile int g_running = 1;
 static volatile int g_online = 0;
 static char g_zt_addr[64];
 static uint8_t g_upstream_ip[4];
 static uint16_t g_upstream_port = 0;
+static sem_t g_conn_sem;
 
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
@@ -86,6 +89,8 @@ static void *socks5_thread(void *arg) {
     struct socks_arg *sa = (struct socks_arg *)arg;
     int cfd = sa->client_fd;
     free(sa);
+
+    sem_wait(&g_conn_sem);
 
     uint8_t buf[BUF_SIZE];
 
@@ -229,6 +234,7 @@ proxy_done:
     zts_close(zt_fd);
 done:
     close(cfd);
+    sem_post(&g_conn_sem);
     return NULL;
 }
 
@@ -292,6 +298,7 @@ usage:
         return 1;
     }
 
+    sem_init(&g_conn_sem, 0, MAX_CONCURRENT);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 

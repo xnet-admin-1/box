@@ -1,8 +1,14 @@
 /*
- * ztproxy — ZeroTier userspace TCP proxy (single-threaded event loop)
+ * ztproxy — ZeroTier userspace TCP proxy
  *
- * All zts_* calls happen on one thread. Local sockets use epoll.
- * zts sockets polled with non-blocking recv/send.
+ * Modes:
+ *   -m <map-file>   Mapping file mode (for PRoot extension)
+ *   -s <port>       SOCKS5 mode (standalone proxy)
+ *
+ * Usage:
+ *   ztproxy -p <path> -n <nwid> -s 1080          # SOCKS5 proxy
+ *   ztproxy -p <path> -n <nwid> -m map.bin        # mapping file mode
+ *   ztproxy -p <path> -l -s 1080                  # local controller + SOCKS5
  */
 
 #include <stdio.h>
@@ -16,11 +22,13 @@
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <android/log.h>
+#include <semaphore.h>
 
 #include "ZeroTier.h"
 
@@ -28,14 +36,42 @@
 #define LOG(fmt, ...) __android_log_print(ANDROID_LOG_INFO, TAG, fmt, ##__VA_ARGS__)
 #define ERR(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, TAG, fmt, ##__VA_ARGS__)
 
-#define MAX_CONNS 64
 #define BUF_SIZE 16384
+#define MAX_CONCURRENT 4
 
 static volatile int g_running = 1;
 static volatile int g_online = 0;
 static char g_zt_addr[64];
 static uint8_t g_upstream_ip[4];
 static uint16_t g_upstream_port = 0;
+static sem_t g_conn_sem;
+static pthread_mutex_t g_zts_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Thread-safe wrappers for zts calls */
+static int safe_zts_socket(int af, int type, int proto) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_socket(af, type, proto);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
+static int safe_zts_connect(int fd, const struct sockaddr *sa, int len) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_connect(fd, sa, len);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
+static int safe_zts_send(int fd, const void *buf, int len, int flags) {
+    return zts_send(fd, buf, len, flags);
+}
+static int safe_zts_recv(int fd, void *buf, int len, int flags) {
+    return zts_recv(fd, buf, len, flags);
+}
+static int safe_zts_close(int fd) {
+    pthread_mutex_lock(&g_zts_lock);
+    int r = zts_close(fd);
+    pthread_mutex_unlock(&g_zts_lock);
+    return r;
+}
 
 static void on_signal(int sig) { (void)sig; g_running = 0; }
 
@@ -49,296 +85,184 @@ static void zt_callback(struct zts_callback_msg *msg) {
         g_online = 1;
 }
 
-static void set_nonblock(int fd) {
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-}
+/* ── SOCKS5 handler (one thread per connection) ─────────────── */
 
-/* Connection states */
-enum {
-    S_GREETING,       /* reading SOCKS5 greeting from client */
-    S_REQUEST,        /* reading SOCKS5 request from client */
-    S_ZT_CONNECTING,  /* zts_connect in progress (worker thread) */
-    S_CONNECTED,      /* worker done, ready for relay */
-    S_UPSTREAM_GREET, /* sent greeting to upstream, waiting reply */
-    S_UPSTREAM_REQ,   /* sent CONNECT to upstream, waiting reply */
-    S_RELAY,          /* bidirectional relay */
-    S_DEAD,
-};
+struct relay_ctx { int from_fd; int to_fd; volatile int *done; };
 
-struct conn {
-    int state;
-    int cfd;          /* local client fd */
-    int zfd;          /* zts fd (-1 if not yet) */
-    uint8_t buf[512]; /* small buffer for handshake */
-    int buf_len;
-    /* Relay buffers */
-    uint8_t c2z[BUF_SIZE]; /* client → zt */
-    int c2z_len, c2z_off;
-    uint8_t z2c[BUF_SIZE]; /* zt → client */
-    int z2c_len, z2c_off;
-    /* Request info for upstream */
-    uint8_t atyp;
-    uint8_t dst_ip[4];
-    uint8_t domain[260];
-    int domain_len;
-    uint16_t dst_port;
-    char dst_str[256];
-};
-
-static struct conn conns[MAX_CONNS];
-static int epfd;
-
-static struct conn *alloc_conn(int cfd) {
-    for (int i = 0; i < MAX_CONNS; i++) {
-        if (conns[i].state == S_DEAD && conns[i].cfd == -1) {
-            memset(&conns[i], 0, sizeof(struct conn));
-            conns[i].cfd = cfd;
-            conns[i].zfd = -1;
-            conns[i].state = S_GREETING;
-            return &conns[i];
+static void *relay_zt_to_local(void *arg) {
+    struct relay_ctx *r = (struct relay_ctx *)arg;
+    uint8_t rbuf[BUF_SIZE];
+    while (1) {
+        int n = safe_zts_recv(r->from_fd, rbuf, sizeof(rbuf), 0);
+        if (n <= 0) break;
+        int sent = 0;
+        while (sent < n) {
+            int w = write(r->to_fd, rbuf + sent, n - sent);
+            if (w <= 0) goto out;
+            sent += w;
         }
     }
+out:
+    *r->done = 1;
+    free(r);
     return NULL;
 }
 
-static void free_conn(struct conn *c) {
-    if (c->cfd >= 0) { epoll_ctl(epfd, EPOLL_CTL_DEL, c->cfd, NULL); close(c->cfd); }
-    if (c->zfd >= 0) zts_close(c->zfd);
-    c->cfd = -1;
-    c->zfd = -1;
-    c->state = S_DEAD;
-}
+struct socks_arg {
+    int client_fd;
+};
 
-static void epoll_mod(int fd, uint32_t events, void *ptr) {
-    struct epoll_event ev = { .events = events, .data.ptr = ptr };
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-}
+static void *socks5_thread(void *arg) {
+    struct socks_arg *sa = (struct socks_arg *)arg;
+    int cfd = sa->client_fd;
+    free(sa);
 
-/* Build lwip sockaddr */
-static void make_lwip_sa(uint8_t *sa, const uint8_t *ip, uint16_t port) {
-    memset(sa, 0, 16);
-    sa[0] = 16;
-    sa[1] = AF_INET;
-    sa[2] = (port >> 8) & 0xff;
-    sa[3] = port & 0xff;
-    memcpy(&sa[4], ip, 4);
-}
+    sem_wait(&g_conn_sem);
 
-/* Process SOCKS5 greeting */
-static void on_greeting(struct conn *c) {
-    int n = recv(c->cfd, c->buf + c->buf_len, sizeof(c->buf) - c->buf_len, 0);
-    if (n <= 0) { free_conn(c); return; }
-    c->buf_len += n;
-    if (c->buf_len < 2) return;
-    if (c->buf[0] != 0x05) { free_conn(c); return; }
-    int need = 2 + c->buf[1];
-    if (c->buf_len < need) return;
-    /* Send no-auth reply */
-    uint8_t reply[] = {0x05, 0x00};
-    send(c->cfd, reply, 2, MSG_NOSIGNAL);
-    c->buf_len = 0;
-    c->state = S_REQUEST;
-}
+    uint8_t buf[BUF_SIZE];
 
-/* Connect worker — runs zts_connect + upstream handshake off the main loop */
-static void *connect_worker(void *arg) {
-    struct conn *c = (struct conn *)arg;
+    /* SOCKS5 greeting */
+    int n = recv(cfd, buf, 2, 0);
+    if (n < 2 || buf[0] != 0x05) goto done;
+    int nmethods = buf[1];
+    if (nmethods > 0) recv(cfd, buf, nmethods, 0); /* consume methods */
+    buf[0] = 0x05; buf[1] = 0x00; /* no auth */
+    send(cfd, buf, 2, 0);
 
+    /* SOCKS5 request */
+    n = recv(cfd, buf, 4, 0);
+    if (n < 4 || buf[0] != 0x05 || buf[1] != 0x01) goto done; /* only CONNECT */
+
+    uint8_t atyp = buf[3];
+    uint8_t dst_ip[4];
+    uint16_t dst_port;
+    char dst_str[256];
+    uint8_t domain_buf[260]; /* for atyp=3: len + domain */
+    int domain_len = 0;
+
+    if (atyp == 0x01) { /* IPv4 */
+        recv(cfd, dst_ip, 4, 0);
+        recv(cfd, &dst_port, 2, 0);
+        dst_port = ntohs(dst_port);
+        snprintf(dst_str, sizeof(dst_str), "%d.%d.%d.%d", dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+    } else if (atyp == 0x03) { /* Domain */
+        uint8_t dlen;
+        recv(cfd, &dlen, 1, 0);
+        recv(cfd, domain_buf + 1, dlen, 0);
+        domain_buf[0] = dlen;
+        domain_len = 1 + dlen;
+        recv(cfd, &dst_port, 2, 0);
+        dst_port = ntohs(dst_port);
+        memcpy(dst_str, domain_buf + 1, dlen);
+        dst_str[dlen] = 0;
+        if (!g_upstream_port) {
+            /* No upstream — can't resolve domains */
+            buf[0] = 0x05; buf[1] = 0x04; memset(buf+2, 0, 8);
+            send(cfd, buf, 10, 0);
+            goto done;
+        }
+    } else {
+        goto done;
+    }
+
+    LOG("SOCKS5 CONNECT %s:%d", dst_str, dst_port);
+
+    /* Connect via libzt — to upstream SOCKS5 or directly */
     uint8_t connect_ip[4];
     uint16_t connect_port;
     if (g_upstream_port) {
         memcpy(connect_ip, g_upstream_ip, 4);
         connect_port = g_upstream_port;
     } else {
-        memcpy(connect_ip, c->dst_ip, 4);
-        connect_port = c->dst_port;
+        memcpy(connect_ip, dst_ip, 4);
+        connect_port = dst_port;
     }
 
+    int zt_fd = safe_zts_socket(AF_INET, SOCK_STREAM, 0);
+    if (zt_fd < 0) {
+        buf[0] = 0x05; buf[1] = 0x01; memset(buf+2, 0, 8);
+        send(cfd, buf, 10, 0);
+        goto done;
+    }
+
+    /* lwip sockaddr: sin_len + sin_family + sin_port(BE) + sin_addr */
     uint8_t lwip_sa[16];
-    make_lwip_sa(lwip_sa, connect_ip, connect_port);
+    memset(lwip_sa, 0, 16);
+    lwip_sa[0] = 16;
+    lwip_sa[1] = AF_INET;
+    lwip_sa[2] = (connect_port >> 8) & 0xff;
+    lwip_sa[3] = connect_port & 0xff;
+    memcpy(&lwip_sa[4], connect_ip, 4);
 
-    if (zts_connect(c->zfd, (struct sockaddr *)lwip_sa, 16) < 0) {
-        ERR("zt connect %s:%d failed", c->dst_str, c->dst_port);
-        c->state = S_DEAD; /* signal main loop to clean up */
-        return NULL;
+    if (safe_zts_connect(zt_fd, (struct sockaddr *)lwip_sa, 16) < 0) {
+        ERR("zt connect %s:%d failed", dst_str, dst_port);
+        safe_zts_close(zt_fd);
+        buf[0] = 0x05; buf[1] = 0x05; memset(buf+2, 0, 8);
+        send(cfd, buf, 10, 0);
+        goto done;
     }
 
+    /* SOCKS5 success reply */
+    buf[0] = 0x05; buf[1] = 0x00; buf[2] = 0x00; buf[3] = 0x01;
+    memset(buf+4, 0, 6);
+    send(cfd, buf, 10, 0);
+
+    /* If upstream, do SOCKS5 handshake with upstream */
     if (g_upstream_port) {
-        uint8_t buf[300];
-        /* Upstream greeting */
+        /* greeting */
+        buf[0] = 0x05; buf[1] = 1; buf[2] = 0;
+        safe_zts_send(zt_fd, buf, 3, 0);
+        if (safe_zts_recv(zt_fd, buf, 2, 0) < 2 || buf[1] != 0) {
+            ERR("upstream auth failed"); safe_zts_close(zt_fd); goto done;
+        }
+        /* CONNECT request */
         buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00;
-        zts_send(c->zfd, buf, 3, 0);
-        if (zts_recv(c->zfd, buf, 2, 0) < 2 || buf[1] != 0x00) {
-            ERR("upstream auth failed for %s:%d", c->dst_str, c->dst_port);
-            c->state = S_DEAD;
-            return NULL;
+        buf[3] = atyp;
+        int reqlen = 4;
+        if (atyp == 0x01) {
+            memcpy(buf + 4, dst_ip, 4); reqlen += 4;
+        } else if (atyp == 0x03) {
+            memcpy(buf + 4, domain_buf, domain_len); reqlen += domain_len;
         }
-        /* Upstream CONNECT */
-        buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00; buf[3] = c->atyp;
-        int len = 4;
-        if (c->atyp == 0x01) { memcpy(buf+4, c->dst_ip, 4); len += 4; }
-        else { memcpy(buf+4, c->domain, c->domain_len); len += c->domain_len; }
-        uint16_t np = htons(c->dst_port);
-        memcpy(buf+len, &np, 2); len += 2;
-        zts_send(c->zfd, buf, len, 0);
-        if (zts_recv(c->zfd, buf, 10, 0) < 4 || buf[1] != 0x00) {
-            ERR("upstream connect %s:%d failed", c->dst_str, c->dst_port);
-            c->state = S_DEAD;
-            return NULL;
+        uint16_t np = htons(dst_port);
+        memcpy(buf + reqlen, &np, 2); reqlen += 2;
+        safe_zts_send(zt_fd, buf, reqlen, 0);
+        if (safe_zts_recv(zt_fd, buf, 10, 0) < 4 || buf[1] != 0) {
+            ERR("upstream connect %s:%d failed", dst_str, dst_port);
+            safe_zts_close(zt_fd); goto done;
         }
     }
 
-    LOG("proxying %s:%d", c->dst_str, c->dst_port);
-    c->state = S_CONNECTED; /* signal main loop */
+    LOG("proxying %s:%d", dst_str, dst_port);
+
+    /* Bidirectional proxy — two threads */
+    volatile int relay_done = 0;
+
+    struct relay_ctx *rctx = malloc(sizeof(struct relay_ctx));
+    rctx->from_fd = zt_fd; rctx->to_fd = cfd; rctx->done = &relay_done;
+
+    pthread_t relay_tid;
+    pthread_create(&relay_tid, NULL, relay_zt_to_local, rctx);
+    pthread_detach(relay_tid);
+
+    /* This thread: local → zt */
+    while (!relay_done) {
+        n = recv(cfd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        int sent = 0;
+        while (sent < n) {
+            int w = safe_zts_send(zt_fd, buf + sent, n - sent, 0);
+            if (w <= 0) goto proxy_done;
+            sent += w;
+        }
+    }
+
+proxy_done:
+    safe_zts_close(zt_fd);
+done:
+    close(cfd);
+    sem_post(&g_conn_sem);
     return NULL;
-}
-
-/* Process SOCKS5 request */
-static void on_request(struct conn *c) {
-    int n = recv(c->cfd, c->buf + c->buf_len, sizeof(c->buf) - c->buf_len, 0);
-    if (n <= 0) { free_conn(c); return; }
-    c->buf_len += n;
-    if (c->buf_len < 4) return;
-    if (c->buf[0] != 0x05 || c->buf[1] != 0x01) { free_conn(c); return; }
-
-    c->atyp = c->buf[3];
-    int need;
-    if (c->atyp == 0x01) {
-        need = 10; /* 4 header + 4 ip + 2 port */
-    } else if (c->atyp == 0x03) {
-        if (c->buf_len < 5) return;
-        need = 4 + 1 + c->buf[4] + 2;
-    } else {
-        free_conn(c); return;
-    }
-    if (c->buf_len < need) return;
-
-    if (c->atyp == 0x01) {
-        memcpy(c->dst_ip, c->buf + 4, 4);
-        c->dst_port = (c->buf[8] << 8) | c->buf[9];
-        snprintf(c->dst_str, sizeof(c->dst_str), "%d.%d.%d.%d",
-            c->dst_ip[0], c->dst_ip[1], c->dst_ip[2], c->dst_ip[3]);
-    } else {
-        int dlen = c->buf[4];
-        c->domain[0] = dlen;
-        memcpy(c->domain + 1, c->buf + 5, dlen);
-        c->domain_len = 1 + dlen;
-        c->dst_port = (c->buf[5 + dlen] << 8) | c->buf[6 + dlen];
-        memcpy(c->dst_str, c->buf + 5, dlen);
-        c->dst_str[dlen] = 0;
-        if (!g_upstream_port) {
-            uint8_t fail[] = {0x05, 0x04, 0,0,0,0,0,0,0,0};
-            send(c->cfd, fail, 10, MSG_NOSIGNAL);
-            free_conn(c); return;
-        }
-    }
-
-    LOG("CONNECT %s:%d", c->dst_str, c->dst_port);
-
-    /* Create zts socket */
-    c->zfd = zts_socket(AF_INET, SOCK_STREAM, 0);
-    if (c->zfd < 0) {
-        uint8_t fail[] = {0x05, 0x01, 0,0,0,0,0,0,0,0};
-        send(c->cfd, fail, 10, MSG_NOSIGNAL);
-        free_conn(c); return;
-    }
-
-    /* Send success early so client can pipeline */
-    uint8_t ok[] = {0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0};
-    send(c->cfd, ok, 10, MSG_NOSIGNAL);
-
-    /* Stop watching client, spawn connect worker */
-    epoll_mod(c->cfd, 0, c);
-    c->state = S_ZT_CONNECTING;
-    pthread_t tid;
-    pthread_create(&tid, NULL, connect_worker, c);
-    pthread_detach(tid);
-}
-
-/* Process upstream greeting reply */
-static void on_upstream_greet(struct conn *c) {
-    int n = zts_recv(c->zfd, c->buf + c->buf_len, 2 - c->buf_len, MSG_DONTWAIT);
-    if (n == 0) { free_conn(c); return; }
-    if (n < 0) return; /* EAGAIN */
-    c->buf_len += n;
-    if (c->buf_len < 2) return;
-    if (c->buf[1] != 0x00) { ERR("upstream auth failed"); free_conn(c); return; }
-
-    /* Send CONNECT request */
-    uint8_t req[300];
-    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = c->atyp;
-    int len = 4;
-    if (c->atyp == 0x01) {
-        memcpy(req + 4, c->dst_ip, 4); len += 4;
-    } else {
-        memcpy(req + 4, c->domain, c->domain_len); len += c->domain_len;
-    }
-    uint16_t np = htons(c->dst_port);
-    memcpy(req + len, &np, 2); len += 2;
-    zts_send(c->zfd, req, len, 0);
-    c->buf_len = 0;
-    c->state = S_UPSTREAM_REQ;
-}
-
-/* Process upstream CONNECT reply */
-static void on_upstream_req(struct conn *c) {
-    int n = zts_recv(c->zfd, c->buf + c->buf_len, 10 - c->buf_len, MSG_DONTWAIT);
-    if (n == 0) { free_conn(c); return; }
-    if (n < 0) return; /* EAGAIN */
-    c->buf_len += n;
-    if (c->buf_len < 4) return;
-    /* Might get variable length reply, but we need at least 4 bytes to check status */
-    if (c->buf[1] != 0x00) {
-        ERR("upstream connect %s:%d failed (code %d)", c->dst_str, c->dst_port, c->buf[1]);
-        free_conn(c); return;
-    }
-    /* Consume rest of reply (up to 10 bytes for IPv4) */
-    if (c->buf_len < 10) return;
-
-    LOG("proxying %s:%d", c->dst_str, c->dst_port);
-    c->state = S_RELAY;
-    c->c2z_len = c->c2z_off = 0;
-    c->z2c_len = c->z2c_off = 0;
-    epoll_mod(c->cfd, EPOLLIN, c);
-}
-
-/* Relay data */
-static void relay_step(struct conn *c, int client_readable) {
-    /* Client → ZT */
-    for (;;) {
-        if (c->c2z_len == 0) {
-            int n = recv(c->cfd, c->c2z, BUF_SIZE, MSG_DONTWAIT);
-            if (n == 0) { free_conn(c); return; }
-            if (n < 0) break;
-            c->c2z_len = n; c->c2z_off = 0;
-        }
-        while (c->c2z_off < c->c2z_len) {
-            int w = zts_send(c->zfd, c->c2z + c->c2z_off, c->c2z_len - c->c2z_off, MSG_DONTWAIT);
-            if (w <= 0) goto c2z_done;
-            c->c2z_off += w;
-        }
-        c->c2z_len = 0; c->c2z_off = 0;
-    }
-c2z_done:
-    if (c->c2z_off == c->c2z_len) { c->c2z_len = 0; c->c2z_off = 0; }
-
-    /* ZT → Client */
-    for (;;) {
-        if (c->z2c_len == 0) {
-            int n = zts_recv(c->zfd, c->z2c, BUF_SIZE, MSG_DONTWAIT);
-            if (n == 0) { free_conn(c); return; }
-            if (n < 0) break;
-            c->z2c_len = n; c->z2c_off = 0;
-        }
-        while (c->z2c_off < c->z2c_len) {
-            int w = send(c->cfd, c->z2c + c->z2c_off, c->z2c_len - c->z2c_off, MSG_DONTWAIT | MSG_NOSIGNAL);
-            if (w <= 0) goto z2c_done;
-            c->z2c_off += w;
-        }
-        c->z2c_len = 0; c->z2c_off = 0;
-    }
-z2c_done:
-    if (c->z2c_off == c->z2c_len) { c->z2c_len = 0; c->z2c_off = 0; }
 }
 
 /* ── Local controller ────────────────────────────────────────── */
@@ -352,7 +276,7 @@ static uint64_t create_local_network(const char *zt_path, uint64_t node_id) {
     snprintf(dir, sizeof(dir), "%s/controller.d/network", zt_path);
     mkdir(dir, 0700);
     snprintf(path, sizeof(path), "%s/%s.json", dir, nwid_str);
-    if (access(path, F_OK) == 0) return nwid;
+    if (access(path, F_OK) == 0) { LOG("network %s exists", nwid_str); return nwid; }
     FILE *f = fopen(path, "w");
     if (!f) return 0;
     fprintf(f,
@@ -363,6 +287,7 @@ static uint64_t create_local_network(const char *zt_path, uint64_t node_id) {
         "\"creationTime\":%lld,\"rules\":[{\"type\":\"ACTION_ACCEPT\"}]}",
         nwid_str, nwid_str, (long long)time(NULL) * 1000);
     fclose(f);
+    LOG("created network %s", nwid_str);
     return nwid;
 }
 
@@ -385,7 +310,7 @@ int main(int argc, char **argv) {
             case 'l': local_controller = 1; break;
             case 'u': {
                 char tmp[64];
-                strncpy(tmp, optarg, sizeof(tmp)-1); tmp[63] = 0;
+                strncpy(tmp, optarg, sizeof(tmp)-1);
                 char *colon = strrchr(tmp, ':');
                 if (colon) { *colon = 0; inet_pton(AF_INET, tmp, g_upstream_ip); g_upstream_port = atoi(colon+1); }
                 break;
@@ -400,11 +325,13 @@ usage:
         return 1;
     }
 
+    sem_init(&g_conn_sem, 0, MAX_CONCURRENT);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
     LOG("starting: path=%s nwid=%llx zt_port=%d socks=%d", zt_path, (unsigned long long)nwid, zt_port, socks_port);
 
+    /* Local controller: pre-create network */
     if (local_controller) {
         char id_path[512];
         snprintf(id_path, sizeof(id_path), "%s/identity.public", zt_path);
@@ -421,6 +348,7 @@ usage:
         }
     }
 
+    /* Start libzt */
     if (zts_start(zt_path, zt_callback, zt_port) != 0) { ERR("zts_start failed"); return 1; }
 
     LOG("waiting for online...");
@@ -433,83 +361,42 @@ usage:
     if (local_controller && !nwid) {
         nwid = create_local_network(zt_path, node_id);
         if (!nwid) return 1;
+        LOG("first run — restart to load network");
         zts_stop();
         return 2;
     }
 
+    LOG("joining %llx...", (unsigned long long)nwid);
     zts_join(nwid);
+
     LOG("waiting for address...");
     for (int i = 0; i < 60 && g_running && !g_zt_addr[0]; i++) sleep(1);
     if (!g_zt_addr[0]) { ERR("no address"); return 1; }
-    LOG("ready: %s socks=%d", g_zt_addr, socks_port);
-
-    /* Init connections */
-    for (int i = 0; i < MAX_CONNS; i++) { conns[i].cfd = -1; conns[i].zfd = -1; conns[i].state = S_DEAD; }
+    LOG("ready: %s on port %d, SOCKS5 on :%d", g_zt_addr, zt_port, socks_port);
 
     /* SOCKS5 listener */
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = htons(socks_port) };
-    if (bind(sfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { ERR("bind: %s", strerror(errno)); return 1; }
-    listen(sfd, 64);
-    set_nonblock(sfd);
-
-    epfd = epoll_create1(0);
-    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = NULL }; /* NULL = listener */
-    epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev);
-
-    LOG("SOCKS5 on 127.0.0.1:%d", socks_port);
-
-    struct epoll_event events[64];
+    if (bind(sfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { ERR("bind %d: %s", socks_port, strerror(errno)); return 1; }
+    listen(sfd, 32);
+    LOG("SOCKS5 listening on 127.0.0.1:%d", socks_port);
 
     while (g_running) {
-        /* Short timeout so we can poll zts sockets */
-        int nev = epoll_wait(epfd, events, 64, 1);
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        int cfd = accept(sfd, (struct sockaddr *)&peer, &plen);
+        if (cfd < 0) { if (errno == EINTR) continue; break; }
 
-        for (int i = 0; i < nev; i++) {
-            struct conn *c = events[i].data.ptr;
-            if (!c) {
-                /* Listener: accept */
-                while (1) {
-                    int cfd = accept(sfd, NULL, NULL);
-                    if (cfd < 0) break;
-                    set_nonblock(cfd);
-                    struct conn *nc = alloc_conn(cfd);
-                    if (!nc) { close(cfd); continue; }
-                    struct epoll_event cev = { .events = EPOLLIN, .data.ptr = nc };
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev);
-                }
-                continue;
-            }
-            if (events[i].events & (EPOLLERR | EPOLLHUP)) { free_conn(c); continue; }
-            if (c->state == S_GREETING) on_greeting(c);
-            else if (c->state == S_REQUEST) on_request(c);
-            else if (c->state == S_RELAY) relay_step(c, 1);
-        }
-
-        /* Poll zts-side for all active connections */
-        for (int i = 0; i < MAX_CONNS; i++) {
-            struct conn *c = &conns[i];
-            if (c->state == S_CONNECTED) {
-                /* Worker finished — transition to relay */
-                c->state = S_RELAY;
-                c->c2z_len = c->c2z_off = 0;
-                c->z2c_len = c->z2c_off = 0;
-                epoll_mod(c->cfd, EPOLLIN, c);
-            } else if (c->state == S_DEAD && c->cfd >= 0) {
-                /* Worker failed */
-                free_conn(c);
-            } else if (c->state == S_RELAY) {
-                relay_step(c, 0);
-            }
-        }
+        struct socks_arg *arg = malloc(sizeof(struct socks_arg));
+        arg->client_fd = cfd;
+        pthread_t tid;
+        pthread_create(&tid, NULL, socks5_thread, arg);
+        pthread_detach(tid);
     }
 
-    /* Cleanup */
-    for (int i = 0; i < MAX_CONNS; i++) if (conns[i].state != S_DEAD) free_conn(&conns[i]);
     close(sfd);
-    close(epfd);
     zts_leave(nwid);
     zts_stop();
     return 0;

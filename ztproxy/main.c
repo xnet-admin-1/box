@@ -19,6 +19,8 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <android/log.h>
@@ -205,27 +207,76 @@ static struct map_entry *open_map(const char *path) {
     return (p == MAP_FAILED) ? NULL : (struct map_entry *)p;
 }
 
+/* Create a local network on the embedded controller.
+ * Network ID = <node-id-10-hex> + "ffff01"
+ * Auto-authorizes all members, assigns 172.29.0.0/16 */
+static uint64_t create_local_network(const char *zt_path, uint64_t node_id) {
+    uint64_t nwid = (node_id << 24) | 0xffff01ULL;
+    char nwid_str[20];
+    snprintf(nwid_str, sizeof(nwid_str), "%016llx", (unsigned long long)nwid);
+
+    char dir[512], path[512];
+    snprintf(dir, sizeof(dir), "%s/controller.d/network", zt_path);
+    /* mkdir -p */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s/controller.d", zt_path);
+    mkdir(tmp, 0700);
+    mkdir(dir, 0700);
+
+    snprintf(path, sizeof(path), "%s/%s.json", dir, nwid_str);
+
+    /* Check if already exists */
+    if (access(path, F_OK) == 0) {
+        LOG("local network %s already exists", nwid_str);
+        return nwid;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) { ERR("cannot create network config: %s", path); return 0; }
+    fprintf(f,
+        "{\n"
+        "  \"id\": \"%s\",\n"
+        "  \"nwid\": \"%s\",\n"
+        "  \"name\": \"box-local\",\n"
+        "  \"private\": false,\n"
+        "  \"v4AssignMode\": { \"zt\": true },\n"
+        "  \"ipAssignmentPools\": [{ \"ipRangeStart\": \"172.29.0.1\", \"ipRangeEnd\": \"172.29.255.254\" }],\n"
+        "  \"routes\": [{ \"target\": \"172.29.0.0/16\" }],\n"
+        "  \"revision\": 1,\n"
+        "  \"objtype\": \"network\",\n"
+        "  \"creationTime\": %lld,\n"
+        "  \"rules\": [{\"type\": \"ACTION_ACCEPT\"}]\n"
+        "}\n",
+        nwid_str, nwid_str, (long long)time(NULL) * 1000);
+    fclose(f);
+    LOG("created local network %s (172.29.0.0/16, public)", nwid_str);
+    return nwid;
+}
+
 int main(int argc, char **argv) {
     char *zt_path = NULL;
     uint64_t nwid = 0;
     int zt_port = 29994;
     char *map_path = NULL;
+    int local_controller = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:n:P:m:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:n:P:m:l")) != -1) {
         switch (opt) {
             case 'p': zt_path = optarg; break;
             case 'n': nwid = strtoull(optarg, NULL, 16); break;
             case 'P': zt_port = atoi(optarg); break;
             case 'm': map_path = optarg; break;
+            case 'l': local_controller = 1; break;
             default:
-                fprintf(stderr, "usage: ztproxy -p <zt-path> -n <network-id> [-P port] [-m map-file]\n");
+                fprintf(stderr, "usage: ztproxy -p <zt-path> [-n <network-id>] [-l] [-P port] [-m map-file]\n");
                 return 1;
         }
     }
 
-    if (!zt_path || !nwid) {
-        fprintf(stderr, "usage: ztproxy -p <zt-path> -n <network-id> [-P port] [-m map-file]\n");
+    if (!zt_path || (!nwid && !local_controller)) {
+        fprintf(stderr, "usage: ztproxy -p <zt-path> -n <network-id>  (join remote network)\n"
+                        "       ztproxy -p <zt-path> -l               (local controller)\n");
         return 1;
     }
 
@@ -244,6 +295,27 @@ int main(int argc, char **argv) {
     g_map = open_map(map_path);
     if (!g_map) { ERR("failed to open map: %s", map_path); return 1; }
 
+    /* Local controller: pre-create network before zts_start so controller loads it */
+    if (local_controller) {
+        /* Read node ID from identity file if it exists */
+        char id_path[512];
+        snprintf(id_path, sizeof(id_path), "%s/identity.public", zt_path);
+        FILE *idf = fopen(id_path, "r");
+        if (idf) {
+            char id_buf[256];
+            if (fgets(id_buf, sizeof(id_buf), idf)) {
+                char *colon = strchr(id_buf, ':');
+                if (colon) *colon = 0;
+                uint64_t node_id = strtoull(id_buf, NULL, 16);
+                if (node_id) {
+                    nwid = create_local_network(zt_path, node_id);
+                    LOG("pre-created network for node %llx", (unsigned long long)node_id);
+                }
+            }
+            fclose(idf);
+        }
+    }
+
     /* Init libzt */
     if (zts_start(zt_path, zt_callback, zt_port) != 0) {
         ERR("zts_start failed"); return 1;
@@ -253,6 +325,19 @@ int main(int argc, char **argv) {
     LOG("waiting for node online...");
     for (int i = 0; i < 30 && g_running && !g_online; i++) sleep(1);
     if (!g_online) { ERR("node never came online"); return 1; }
+
+    uint64_t node_id = zts_get_node_id();
+    LOG("node id: %llx", (unsigned long long)node_id);
+
+    /* Local controller: create network if not pre-created (first run) */
+    if (local_controller && !nwid) {
+        nwid = create_local_network(zt_path, node_id);
+        if (!nwid) { ERR("failed to create local network"); return 1; }
+        /* Network created after controller init — need restart for controller to pick it up */
+        LOG("first run: restart ztproxy to load the new network");
+        zts_stop();
+        return 2; /* signal caller to restart */
+    }
 
     /* Join network */
     LOG("joining %llx...", (unsigned long long)nwid);

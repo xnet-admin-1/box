@@ -1,0 +1,12 @@
+services:
+  drop:
+    build: .
+    container_name: drop
+    restart: unless-stopped
+    ports:
+      - "9800:9800"
+    volumes:
+      - ./data:/data
+    environment:
+      - DROP_DATA=/data/drop
+      - DROP_CREDS=/data/.creds

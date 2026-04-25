@@ -1,9 +1,5 @@
-# Build outputs
-/out/
-/tmp/
+box
+drop
+data/
+ztproxy/build/
 *.o
-*.a
-
-# OS
-.DS_Store
-Thumbs.db

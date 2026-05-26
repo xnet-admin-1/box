@@ -3,6 +3,9 @@
 /tmp/
 *.o
 *.a
+box
+drop
+data/
 
 # OS
 .DS_Store
